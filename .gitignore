@@ -1,0 +1,23 @@
+# 忽略 python 编译产生的垃圾文件
+__pycache__/
+*.pyc
+
+# 忽略我们即将生成的大型数据文件
+*.h5
+*.p
+*.pickle
+*.csv
+
+# 忽略生成的图片
+*.png
+*.pdf
+*.svg
+
+# 忽略具体的输出文件夹（代码里会往这些地方写东西）
+data/
+models/
+figures/
+morphology/
+
+.idea/
+x86_64/

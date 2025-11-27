@@ -2,7 +2,7 @@ import os
 import sys
 import numpy as np
 from scipy import signal
-import cPickle as pickle
+import pickle
 import time
 import neuron
 from neuron import h
@@ -28,8 +28,8 @@ np.random.seed(randomSeed)
 #%% define simulation params
 
 # general simulation parameters
-numSimulations = 128
-totalSimDurationInSec = 6
+numSimulations = 1
+totalSimDurationInSec = 12
 
 # switch whether to store dendritic voltage traces (DVTs), which take up a lot of storage
 collectAndSaveDVTs = True
@@ -88,7 +88,7 @@ min_seg_length_um = 10.0
 
 # beaurrocracy
 showPlots = False
-resultsSavedIn_rootFolder = '/david.beniaguev/Reseach/Single_Neuron_InOut/ExperimentalData/'
+resultsSavedIn_rootFolder = 'data/'
 
 useCvode = True
 totalSimDurationInMS = 1000 * totalSimDurationInSec
@@ -337,9 +337,12 @@ def CreateCombinedColorImage(dendriticVoltageTraces, excitatoryInputSpikes, inhi
 h.load_file('nrngui.hoc')
 h.load_file("import3d.hoc")
 
-morphologyFilename = "morphologies/cell1.asc"
-biophysicalModelFilename = "L5PCbiophys5b.hoc"
-biophysicalModelTemplateFilename = "L5PCtemplate_2.hoc"
+morphologyFilename = "L5PC_NEURON_simulation/morphologies/cell1.asc"
+biophysicalModelFilename = "L5PC_NEURON_simulation/L5PCbiophys5b.hoc"
+biophysicalModelTemplateFilename = "L5PC_NEURON_simulation/L5PCtemplate_2.hoc"
+
+# maybe a problem
+h.celsius = 34.0
 
 h.load_file(biophysicalModelFilename)
 h.load_file(biophysicalModelTemplateFilename)

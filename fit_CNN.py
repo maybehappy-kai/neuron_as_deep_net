@@ -3,15 +3,21 @@ import pandas as pd
 import glob
 import time
 import sys
-import keras
-from keras.models import Model, load_model
-from keras.optimizers import SGD, Nadam
-from keras.layers.normalization import BatchNormalization
-from keras.layers import Dense, Dropout, Activation, Flatten, Input, TimeDistributed, Reshape, Permute
-from keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, Conv1D, Cropping1D, UpSampling1D, MaxPooling1D, AveragePooling1D
-from keras.layers.advanced_activations import LeakyReLU, PReLU, ELU
-from keras.regularizers import l1,l2,l1_l2
-from keras import initializers
+# === 粘贴这些 ===
+import tensorflow as tf
+from tensorflow.keras.layers import Lambda  # 确保引入 Lambda
+from tensorflow import keras
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.optimizers import SGD, Nadam
+# 注意：BatchNormalization 在新版里直接在 layers 下
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.layers import Dense, Dropout, Activation, Flatten, Input, TimeDistributed, Reshape, Permute
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, Conv1D, Cropping1D, UpSampling1D, MaxPooling1D, AveragePooling1D
+# 注意：高级激活函数也在 layers 下了
+from tensorflow.keras.layers import LeakyReLU, PReLU, ELU
+from tensorflow.keras.regularizers import l1,l2,l1_l2
+from tensorflow.keras import initializers
+# ===============
 from sklearn import decomposition
 
 
@@ -53,26 +59,26 @@ synapse_type = 'NMDA'
 if synapse_type == 'NMDA':
     num_DVT_components = 20
 
-    train_data_dir = '/Reseach/Single_Neuron_InOut/data/L5PC_NMDA_train/'
-    valid_data_dir = '/Reseach/Single_Neuron_InOut/data/L5PC_NMDA_valid/'
-    test_data_dir  = '/Reseach/Single_Neuron_InOut/data/L5PC_NMDA_test/'
-    models_dir     = '/Reseach/Single_Neuron_InOut/models/NMDA/'
+    train_data_dir = 'data/L5PC_NMDA_train/'
+    valid_data_dir = 'data/L5PC_NMDA_valid/'
+    test_data_dir = 'data/L5PC_NMDA_test/'
+    models_dir = 'models/NMDA/'
     
 elif synapse_type == 'AMPA':
     num_DVT_components = 30
 
-    train_data_dir = '/Reseach/Single_Neuron_InOut/data/L5PC_AMPA_train/'
-    valid_data_dir = '/Reseach/Single_Neuron_InOut/data/L5PC_AMPA_valid/'
-    test_data_dir  = '/Reseach/Single_Neuron_InOut/data/L5PC_AMPA_test/'
-    models_dir     = '/Reseach/Single_Neuron_InOut/models/AMPA/'
+    train_data_dir = 'data/L5PC_NMDA_train/'
+    valid_data_dir = 'data/L5PC_NMDA_valid/'
+    test_data_dir = 'data/L5PC_NMDA_test/'
+    models_dir = 'models/NMDA/'
     
 elif synapse_type == 'AMPA_SK':
     num_DVT_components = 30
 
-    train_data_dir = '/Reseach/Single_Neuron_InOut/data/L5PC_AMPA_SK_train/'
-    valid_data_dir = '/Reseach/Single_Neuron_InOut/data/L5PC_AMPA_SK_valid/'
-    test_data_dir  = '/Reseach/Single_Neuron_InOut/data/L5PC_AMPA_SK_test/'
-    models_dir     = '/Reseach/Single_Neuron_InOut/models/AMPA_SK/'
+    train_data_dir = 'data/L5PC_NMDA_train/'
+    valid_data_dir = 'data/L5PC_NMDA_valid/'
+    test_data_dir = 'data/L5PC_NMDA_test/'
+    models_dir = 'models/NMDA/'
 # ------------------------------------------------------------------
 
 
@@ -92,23 +98,23 @@ num_epochs = 250
 
 DVT_loss_mult_factor = 0.1
 
-batch_size_per_epoch        = [8] * num_epochs
+batch_size_per_epoch        = [128] * num_epochs
 learning_rate_per_epoch     = [0.0001] * len(batch_size_per_epoch)
 loss_weights_per_epoch      = [[1.0, 0.0200, DVT_loss_mult_factor * 0.00005]] * len(batch_size_per_epoch)
 num_train_steps_per_epoch   = [100] * len(batch_size_per_epoch)
 
 for i in range(40,num_epochs):
-    batch_size_per_epoch[i]    = 8
+    batch_size_per_epoch[i]    = 128
     learning_rate_per_epoch[i] = 0.00003
     loss_weights_per_epoch[i]  = [2.0, 0.0100, DVT_loss_mult_factor * 0.00003]
-    
+
 for i in range(80,num_epochs):
-    batch_size_per_epoch[i]    = 8
+    batch_size_per_epoch[i]    = 128
     learning_rate_per_epoch[i] = 0.00001
     loss_weights_per_epoch[i]  = [4.0, 0.0100, DVT_loss_mult_factor * 0.00001]
 
 for i in range(120,num_epochs):
-    batch_size_per_epoch[i]    = 8
+    batch_size_per_epoch[i]    = 128
     learning_rate_per_epoch[i] = 0.000003
     loss_weights_per_epoch[i]  = [8.0, 0.0100, DVT_loss_mult_factor * 0.0000001]
 
@@ -188,9 +194,13 @@ num_syn_types = 1
 #filter_sizes_per_layer        = [54,12,12,12,12,12,12]
 #num_filters_per_layer         = [256]*network_depth
 
-network_depth = 3
-filter_sizes_per_layer        = [54,24,24]
-num_filters_per_layer         = [64] * network_depth
+# network_depth = 3
+# filter_sizes_per_layer        = [54,24,24]
+# num_filters_per_layer         = [64] * network_depth
+
+network_depth = 7
+filter_sizes_per_layer        = [45,19,19,19,19,19,19]
+num_filters_per_layer         = [128]*network_depth
 
 initializer_per_layer         = [0.002] * network_depth
 activation_function_per_layer = ['relu'] * network_depth
@@ -487,13 +497,13 @@ def sample_windows_from_sims(sim_experiment_files, batch_size=16, window_size_ms
 
 
 class SimulationDataGenerator(keras.utils.Sequence):
-    'thread-safe data genertor for network training'
+    'thread-safe data genertor for network training (Pre-loaded to RAM version)'
 
     def __init__(self, sim_experiment_files, num_files_per_epoch=10,
                  batch_size=8, window_size_ms=300, file_load=0.3, DVT_PCA_model=None,
                  ignore_time_from_start=500, y_train_soma_bias=-67.7, y_soma_threshold=-55.0, y_DTV_threshold=3.0):
         'data generator initialization'
-        
+
         self.sim_experiment_files = sim_experiment_files
         self.num_files_per_epoch = num_files_per_epoch
         self.batch_size = batch_size
@@ -504,34 +514,61 @@ class SimulationDataGenerator(keras.utils.Sequence):
         self.y_train_soma_bias = y_train_soma_bias
         self.y_soma_threshold = y_soma_threshold
         self.y_DTV_threshold = y_DTV_threshold
-        
+
+        # --- 修改开始：预加载所有数据到内存 ---
+        print('-------------------------------------------------------------------------')
+        print(f'Pre-loading {len(self.sim_experiment_files)} files into RAM to eliminate I/O bottlenecks...')
+        self.file_cache = {}
+
+        for i, file_path in enumerate(self.sim_experiment_files):
+            print(f'Loading file {i+1}/{len(self.sim_experiment_files)}: {file_path.split("/")[-1]}')
+
+            # 1. 读取原始数据
+            X, y_spike, y_soma, y_DVT = parse_sim_experiment_file_with_DVT(file_path, DVT_PCA_model=self.DVT_PCA_model)
+
+            # 2. 预处理 (与原版 load_new_file 逻辑完全一致)
+            X = np.transpose(X, axes=[2, 1, 0])
+            y_spike = y_spike.T[:, :, np.newaxis]
+            y_soma = y_soma.T[:, :, np.newaxis]
+            y_DVT = np.transpose(y_DVT, axes=[2, 1, 0])
+
+            # 3. 阈值处理和去偏置
+            y_soma[y_soma > self.y_soma_threshold] = self.y_soma_threshold
+            y_DVT[y_DVT > self.y_DTV_threshold] = self.y_DTV_threshold
+            y_DVT[y_DVT < -self.y_DTV_threshold] = -self.y_DTV_threshold
+            y_soma = y_soma - self.y_train_soma_bias
+
+            # 4. 存入缓存
+            self.file_cache[file_path] = (X, y_spike, y_soma, y_DVT)
+
+        print('All files loaded into RAM.')
+        # --- 修改结束 ---
+
         self.curr_epoch_files_to_use = None
         self.on_epoch_end()
         self.curr_file_index = -1
         self.load_new_file()
         self.batches_per_file_dict = {}
-        
+
         # gather information regarding the loaded file
         self.num_simulations_per_file, self.sim_duration_ms, self.num_segments = self.X.shape
         self.num_output_channels_y1 = self.y_spike.shape[2]
         self.num_output_channels_y2 = self.y_soma.shape[2]
         self.num_output_channels_y3 = self.y_DVT.shape[2]
-        
+
         # determine how many batches in total can enter in the file
         self.max_batches_per_file = (self.num_simulations_per_file * self.sim_duration_ms) / (self.batch_size * self.window_size_ms)
         self.batches_per_file     = int(self.file_load * self.max_batches_per_file)
         self.batches_per_epoch = self.batches_per_file * self.num_files_per_epoch
 
         print('-------------------------------------------------------------------------')
-
         print('file load = %.4f, max batches per file = %d, batches per epoch = %d' %(self.file_load,
                                                                                       self.max_batches_per_file,
                                                                                       self.batches_per_epoch))
         print('num batches per file = %d. coming from (%dx%d),(%dx%d)' %(self.batches_per_file, self.num_simulations_per_file,
                                                                          self.sim_duration_ms, self.batch_size, self.window_size_ms))
-
         print('-------------------------------------------------------------------------')
-        
+
 
     def __len__(self):
         'Denotes the number of batches per epoch'
@@ -540,17 +577,17 @@ class SimulationDataGenerator(keras.utils.Sequence):
 
     def __getitem__(self, batch_ind_within_epoch):
         'Generate one batch of data'
-        
+
         if ((batch_ind_within_epoch + 1) % self.batches_per_file) == 0:
             self.load_new_file()
-            
+
         # randomly sample simulations for current batch
         selected_sim_inds = np.random.choice(range(self.num_simulations_per_file), size=self.batch_size, replace=True)
-        
+
         # randomly sample timepoints for current batch
         sampling_start_time = max(self.ignore_time_from_start, self.window_size_ms)
         selected_time_inds = np.random.choice(range(sampling_start_time, self.sim_duration_ms), size=self.batch_size, replace=False)
-        
+
         # gather batch and yield it
         X_batch       = np.zeros((self.batch_size, self.window_size_ms, self.num_segments))
         y_spike_batch = np.zeros((self.batch_size, self.window_size_ms, self.num_output_channels_y1))
@@ -561,46 +598,34 @@ class SimulationDataGenerator(keras.utils.Sequence):
             y_spike_batch[k,:,:] = self.y_spike[sim_ind,win_time - self.window_size_ms:win_time,:]
             y_soma_batch[k,:,:]  = self.y_soma[sim_ind ,win_time - self.window_size_ms:win_time,:]
             y_DVT_batch[k,:,:]   = self.y_DVT[sim_ind  ,win_time - self.window_size_ms:win_time,:]
-        
+
         # increment the number of batches collected from each file
         try:
             self.batches_per_file_dict[self.curr_file_in_use] = self.batches_per_file_dict[self.curr_file_in_use] + 1
         except:
             self.batches_per_file_dict[self.curr_file_in_use] = 1
-        
+
         # return the actual batch
         return (X_batch, [y_spike_batch, y_soma_batch, y_DVT_batch])
 
 
     def on_epoch_end(self):
         'selects new subset of files to draw samples from'
-
+        # 这里的逻辑不变，依然随机选择文件，保证训练的随机性分布与原版一致
         self.curr_epoch_files_to_use = np.random.choice(self.sim_experiment_files, size=self.num_files_per_epoch, replace=False)
 
     def load_new_file(self):
-        'load new file to draw batches from'
+        'load new file to draw batches from (From RAM)'
 
         self.curr_file_index = (self.curr_file_index + 1) % self.num_files_per_epoch
         # update the current file in use
         self.curr_file_in_use = self.curr_epoch_files_to_use[self.curr_file_index]
 
-        # load the file
-        X, y_spike, y_soma, y_DVT = parse_sim_experiment_file_with_DVT(self.curr_file_in_use, DVT_PCA_model=self.DVT_PCA_model)
-
-        # reshape to what is needed
-        X  = np.transpose(X,axes=[2,1,0])
-        y_spike = y_spike.T[:,:,np.newaxis]
-        y_soma  = y_soma.T[:,:,np.newaxis]
-        y_DVT   = np.transpose(y_DVT,axes=[2,1,0])
-
-        # threshold the signals
-        y_soma[y_soma >  self.y_soma_threshold] =  self.y_soma_threshold
-        y_DVT[y_DVT   >  self.y_DTV_threshold]  =  self.y_DTV_threshold
-        y_DVT[y_DVT   < -self.y_DTV_threshold]  = -self.y_DTV_threshold
-
-        y_soma = y_soma - self.y_train_soma_bias
-        
-        self.X, self.y_spike, self.y_soma, self.y_DVT = X, y_spike, y_soma, y_DVT
+        # --- 修改：直接从内存缓存中获取数据 ---
+        # 原始逻辑在这里会调用 parse_sim_experiment_file_with_DVT 读取硬盘，导致 GPU 等待
+        # 现在我们直接从 self.file_cache 字典中取值，速度极快
+        self.X, self.y_spike, self.y_soma, self.y_DVT = self.file_cache[self.curr_file_in_use]
+        # --- 修改结束 ---
 
 
 #%% collect a small dataset of {input,output} recordings for constructing DVT PCA model
@@ -708,7 +733,7 @@ for learning_schedule in range(start_learning_schedule, num_learning_schedules):
     
     train_steps_per_epoch = len(train_data_generator)
     
-    optimizer_to_use = Nadam(lr=learning_rate)
+    optimizer_to_use = Nadam(lr=learning_rate, clipnorm=1.0)
     temporal_conv_net.compile(optimizer=optimizer_to_use, loss=['binary_crossentropy','mse','mse'], loss_weights=loss_weights)
     
     print('-----------------------------------------------')
@@ -718,7 +743,7 @@ for learning_schedule in range(start_learning_schedule, num_learning_schedules):
     print('learning_rate = %.7f' %(learning_rate))
     print('batch_size = %d' %(batch_size))
     print('-----------------------------------------------')
-    
+
     history = temporal_conv_net.fit_generator(generator=train_data_generator,
                                               epochs=num_steps_multiplier,
                                               validation_data=valid_data_generator,
