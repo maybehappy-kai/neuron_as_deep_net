@@ -1,748 +1,564 @@
 import os
+os.environ['NEURON_MODULE_OPTIONS'] = '-nogui'
 import sys
-import numpy as np
-from scipy import signal
-import pickle
 import time
+import math
+import argparse
+import itertools
+import numpy as np
+import h5py
 import neuron
 from neuron import h
-from neuron import gui
-
-# get or randomly generate random seed
-try:
-    randomSeed = int(sys.argv[1])
-    print('random seed selected by user - %d' %(randomSeed))
-except:
-    randomSeed = np.random.randint(100000)
-    print('randomly choose seed - %d' %(randomSeed))
-
-np.random.seed(randomSeed)
-
-# NOTE: during this project I've changed my coding style
-# and was too lazy to edit the old code to match the new style
-# so please ignore any style related wierdness
-# thanks for not being petty about unimportant shit
-
-# ALSO NOTE: prints are for logging purposes
-
-#%% define simulation params
-
-# general simulation parameters
-numSimulations = 1
-totalSimDurationInSec = 12
-
-# switch whether to store dendritic voltage traces (DVTs), which take up a lot of storage
-collectAndSaveDVTs = True
-
-# high res sampling of the voltage and nexus voltages
-numSamplesPerMS_HighRes = 8
-
-# synapse type
-excitatorySynapseType = 'NMDA'    # supported options: {'AMPA','NMDA'}
-# excitatorySynapseType = 'AMPA'    # supported options: {'AMPA','NMDA'}
-inhibitorySynapseType = 'GABA_A'
-
-# use active dendritic conductances switch
-useActiveDendrites = True
-
-# attenuation factor for the conductance of the SK channel
-SKE2_mult_factor = 1.0
-# SKE2_mult_factor = 0.1
-
-# determine the voltage activation curve of the Ih current (HCN channel)
-Ih_vshift = 0
-
-# simulation duration
-sim_duration_sec = totalSimDurationInSec
-sim_duration_ms  = 1000 * sim_duration_sec
-
-# define inst rate between change interval and smoothing sigma options
-inst_rate_sampling_time_interval_options_ms   = [25,30,35,40,45,55,60,65,70,75,80,85,90,100,150,200,300,450]
-temporal_inst_rate_smoothing_sigma_options_ms = [25,30,35,40,50,60,80,100,150,200,300,400,500,600]
-
-inst_rate_sampling_time_interval_jitter_range   = 20
-temporal_inst_rate_smoothing_sigma_jitter_range = 20
-
-# number of spike ranges for the simulation
-
-# AMPA with attenuated SK_E2 conductance
-#num_bas_ex_spikes_per_100ms_range = [0,1900]
-#num_bas_ex_inh_spike_diff_per_100ms_range = [-1500,300]
-#num_apic_ex_spikes_per_100ms_range = [0,2000]
-#num_apic_ex_inh_spike_diff_per_100ms_range = [-1500,300]
-
-# AMPA
-#num_bas_ex_spikes_per_100ms_range = [0,1900]
-#num_bas_ex_inh_spike_diff_per_100ms_range = [-1650,150]
-#num_apic_ex_spikes_per_100ms_range = [0,2000]
-#num_apic_ex_inh_spike_diff_per_100ms_range = [-1650,150]
-
-# NMDA
-num_bas_ex_spikes_per_100ms_range = [0,800]
-num_bas_ex_inh_spike_diff_per_100ms_range = [-600,200]
-num_apic_ex_spikes_per_100ms_range = [0,800]
-num_apic_ex_inh_spike_diff_per_100ms_range = [-600,200]
-
-# "regularization" param for the segment lengths (mainly used to not divide by very small numbers)
-min_seg_length_um = 10.0
-
-# beaurrocracy
-showPlots = False
-resultsSavedIn_rootFolder = 'data/'
-
-useCvode = True
-totalSimDurationInMS = 1000 * totalSimDurationInSec
-
-#%% define some helper functions
 
 
-def generate_input_spike_trains_for_simulation(sim_duration_ms, basal_seg_length_um, apical_seg_length_um, min_seg_length_um,
-                                               num_bas_ex_spikes_per_100ms_range, num_apic_ex_spikes_per_100ms_range,
-                                               num_bas_ex_inh_spike_diff_per_100ms_range, num_apic_ex_inh_spike_diff_per_100ms_range,
-                                               inst_rate_sampling_time_interval_options_ms, temporal_inst_rate_smoothing_sigma_options_ms):
-    
-    # extract the number of basal and apical segments
-    num_basal_segments  = len(basal_seg_length_um)
-    num_apical_segments = len(apical_seg_length_um)
-        
-    # adjust segment lengths (with "min_seg_length_um")
-    adjusted_basal_length_um  = min_seg_length_um + basal_seg_length_um
-    adjusted_apical_length_um = min_seg_length_um + apical_seg_length_um
-    
-    # calc sum of seg length (to be used for normalization later on)
-    total_adjusted_basal_tree_length_um  = adjusted_basal_length_um.sum()
-    total_adjusted_apical_tree_length_um = adjusted_apical_length_um.sum()
-    
-    # randomly sample inst rate (with some uniform noise) smoothing sigma
-    keep_inst_rate_const_for_ms = inst_rate_sampling_time_interval_options_ms[np.random.randint(len(inst_rate_sampling_time_interval_options_ms))]
-    keep_inst_rate_const_for_ms += int(2 * inst_rate_sampling_time_interval_jitter_range * np.random.rand() - inst_rate_sampling_time_interval_jitter_range)
-    
-    # randomly sample smoothing sigma (with some uniform noise)
-    temporal_inst_rate_smoothing_sigma = temporal_inst_rate_smoothing_sigma_options_ms[np.random.randint(len(temporal_inst_rate_smoothing_sigma_options_ms))]
-    temporal_inst_rate_smoothing_sigma += int(2 * temporal_inst_rate_smoothing_sigma_jitter_range * np.random.rand() - temporal_inst_rate_smoothing_sigma_jitter_range)
-    
-    num_inst_rate_samples = int(np.ceil(float(sim_duration_ms) / keep_inst_rate_const_for_ms))
-    
-    # create the coarse inst rates with units of "total spikes per tree per 100 ms"
-    num_bas_ex_spikes_per_100ms   = np.random.uniform(low=num_bas_ex_spikes_per_100ms_range[0], high=num_bas_ex_spikes_per_100ms_range[1], size=(1,num_inst_rate_samples))
-    num_bas_inh_spikes_low_range  = np.maximum(0, num_bas_ex_spikes_per_100ms + num_bas_ex_inh_spike_diff_per_100ms_range[0])
-    num_bas_inh_spikes_high_range = num_bas_ex_spikes_per_100ms + num_bas_ex_inh_spike_diff_per_100ms_range[1]
-    num_bas_inh_spikes_per_100ms  = np.random.uniform(low=num_bas_inh_spikes_low_range, high=num_bas_inh_spikes_high_range, size=(1,num_inst_rate_samples))
-    
-    num_apic_ex_spikes_per_100ms   = np.random.uniform(low=num_apic_ex_spikes_per_100ms_range[0], high=num_apic_ex_spikes_per_100ms_range[1],size=(1,num_inst_rate_samples))
-    num_apic_inh_spikes_low_range  = np.maximum(0, num_apic_ex_spikes_per_100ms + num_apic_ex_inh_spike_diff_per_100ms_range[0])
-    num_apic_inh_spikes_high_range = num_apic_ex_spikes_per_100ms + num_apic_ex_inh_spike_diff_per_100ms_range[1]
-    num_apic_inh_spikes_per_100ms  = np.random.uniform(low=num_apic_inh_spikes_low_range, high=num_apic_inh_spikes_high_range, size=(1,num_inst_rate_samples))
-    
-    # convert to units of "per_1um_per_1ms"
-    ex_bas_spike_rate_per_1um_per_1ms   = num_bas_ex_spikes_per_100ms   / (total_adjusted_basal_tree_length_um  * 100.0)
-    inh_bas_spike_rate_per_1um_per_1ms  = num_bas_inh_spikes_per_100ms  / (total_adjusted_basal_tree_length_um  * 100.0)
-    ex_apic_spike_rate_per_1um_per_1ms  = num_apic_ex_spikes_per_100ms  / (total_adjusted_apical_tree_length_um * 100.0)
-    inh_apic_spike_rate_per_1um_per_1ms = num_apic_inh_spikes_per_100ms / (total_adjusted_apical_tree_length_um * 100.0)
-            
-    # kron by space (uniform distribution across branches per tree)
-    ex_bas_spike_rate_per_seg_per_1ms   = np.kron(ex_bas_spike_rate_per_1um_per_1ms  , np.ones((num_basal_segments,1)))
-    inh_bas_spike_rate_per_seg_per_1ms  = np.kron(inh_bas_spike_rate_per_1um_per_1ms , np.ones((num_basal_segments,1)))
-    ex_apic_spike_rate_per_seg_per_1ms  = np.kron(ex_apic_spike_rate_per_1um_per_1ms , np.ones((num_apical_segments,1)))
-    inh_apic_spike_rate_per_seg_per_1ms = np.kron(inh_apic_spike_rate_per_1um_per_1ms, np.ones((num_apical_segments,1)))
-        
-    # vstack basal and apical
-    ex_spike_rate_per_seg_per_1ms  = np.vstack((ex_bas_spike_rate_per_seg_per_1ms , ex_apic_spike_rate_per_seg_per_1ms))
-    inh_spike_rate_per_seg_per_1ms = np.vstack((inh_bas_spike_rate_per_seg_per_1ms, inh_apic_spike_rate_per_seg_per_1ms))
-    
-    # add some spatial multiplicative randomness (that will be added to the sampling noise)
-    ex_spike_rate_per_seg_per_1ms  = np.random.uniform(low=0.5, high=1.5, size=ex_spike_rate_per_seg_per_1ms.shape ) * ex_spike_rate_per_seg_per_1ms
-    inh_spike_rate_per_seg_per_1ms = np.random.uniform(low=0.5, high=1.5, size=inh_spike_rate_per_seg_per_1ms.shape) * inh_spike_rate_per_seg_per_1ms
-    
-    # concatenate the adjusted length
-    adjusted_length_um = np.hstack((adjusted_basal_length_um, adjusted_apical_length_um))
-    
-    # multiply each segment by it's length (now every segment will have firing rate proportional to it's length)
-    ex_spike_rate_per_seg_per_1ms  = ex_spike_rate_per_seg_per_1ms  * np.tile(adjusted_length_um[:,np.newaxis], [1, ex_spike_rate_per_seg_per_1ms.shape[1]])
-    inh_spike_rate_per_seg_per_1ms = inh_spike_rate_per_seg_per_1ms * np.tile(adjusted_length_um[:,np.newaxis], [1, inh_spike_rate_per_seg_per_1ms.shape[1]])
-        
-    # kron by time (crop if there are leftovers in the end) to fill up the time to 1ms time bins
-    ex_spike_rate_per_seg_per_1ms  = np.kron(ex_spike_rate_per_seg_per_1ms , np.ones((1,keep_inst_rate_const_for_ms)))[:,:sim_duration_ms]
-    inh_spike_rate_per_seg_per_1ms = np.kron(inh_spike_rate_per_seg_per_1ms, np.ones((1,keep_inst_rate_const_for_ms)))[:,:sim_duration_ms]
-    
-    # filter the inst rates according to smoothing sigma
-    smoothing_window = signal.gaussian(1.0 + 7 * temporal_inst_rate_smoothing_sigma, std=temporal_inst_rate_smoothing_sigma)[np.newaxis,:]
-    smoothing_window /= smoothing_window.sum()
-    seg_inst_rate_ex_smoothed  = signal.convolve(ex_spike_rate_per_seg_per_1ms,  smoothing_window, mode='same')
-    seg_inst_rate_inh_smoothed = signal.convolve(inh_spike_rate_per_seg_per_1ms, smoothing_window, mode='same')
-    
-    # sample the instantanous spike prob and then sample the actual spikes
-    ex_inst_spike_prob = np.random.exponential(scale=seg_inst_rate_ex_smoothed)
-    ex_spikes_bin      = np.random.rand(ex_inst_spike_prob.shape[0], ex_inst_spike_prob.shape[1]) < ex_inst_spike_prob
-    
-    inh_inst_spike_prob = np.random.exponential(scale=seg_inst_rate_inh_smoothed)
-    inh_spikes_bin      = np.random.rand(inh_inst_spike_prob.shape[0], inh_inst_spike_prob.shape[1]) < inh_inst_spike_prob
-    
-    return ex_spikes_bin, inh_spikes_bin
+# ==========================================
+# 1. 全局配置 (Configuration) - 增加动态文件名支持
+# ==========================================
+class Config:
+    # 仿真参数
+    DT = 0.1
+    T_SETTLE = 100.0  # 稳定时间
+    T_RECORD = 500.0  # 记录时间 (有效数据)
+    STIM_DELAY = 100.0  # 刺激发生时刻 (相对于 T_RECORD 开始)
+
+    # 电压初始值
+    V_INIT = -80.0
+    CELSIUS = 34.0
+
+    # 突触参数
+    SYN_GMAX_AMPA = 0.0004
+    SYN_GMAX_NMDA = 0.0004
+    SYN_GMAX_GABA = 0.001
+
+    # 文件路径
+    MORPHOLOGY_FILE = "L5PC_NEURON_simulation/morphologies/cell1.asc"
+    BIOPHYS_FILE = "L5PC_NEURON_simulation/L5PCbiophys5b.hoc"
+    TEMPLATE_FILE = "L5PC_NEURON_simulation/L5PCtemplate_2.hoc"
+
+    # 输出文件名将在 main 中动态生成
+    OUTPUT_FILE = "L5PC_output.h5"
+
+    # 数据压缩设置
+    COMPRESSION = "gzip"
+    COMPRESSION_OPTS = 4
 
 
-def GetDirNameAndFileName(numOutputSpikes, randomSeed):
-    # string to describe model name based on params
+# ==========================================
+# 2. 神经元模型包装器 (The Model Wrapper)
+# ==========================================
+class L5PC_Model:
+    def __init__(self, config):
+        self.cfg = config
+        self.cell = None
+        self.synapses = []
+        self.segments = []
+        self.segment_info = {}
+        self.savestate = None  # 新增：用于存储稳态
 
-    cellType = 'L5PC'
-    synapseTypes    = excitatorySynapseType + '_' + inhibitorySynapseType
-    dendritesKind = 'activeDendrites'
-    if not useActiveDendrites:
-        dendritesKind = 'passiveDendrites'
+        self._init_neuron()
+        self._setup_model_and_synapses()
+
+        # 初始化完成后，自动执行一次预热
+        self._warmup()
+
+    def _init_neuron(self):
+        """加载 hoc 文件，初始化 L5PC"""
+        h.load_file('nrngui.hoc')
+        h.load_file("import3d.hoc")
+        h.load_file(self.cfg.BIOPHYS_FILE)
+        h.load_file(self.cfg.TEMPLATE_FILE)
+
+        h.celsius = self.cfg.CELSIUS
+        h.dt = self.cfg.DT
+
+        # 实例化细胞
+        self.cell = h.L5PCtemplate(self.cfg.MORPHOLOGY_FILE)
+
+        # 激活 CVode (但在固定步长记录时通常使用固定 dt)
+        # 为了严格的数据对齐，我们将使用固定步长积分
+        h.cvode_active(0)
+
+    def _setup_model_and_synapses(self):
+        """
+        1. 遍历所有 segment (包括 Soma, Basal, Apical)
+        2. 记录拓扑信息 (parent_indices) - 使用基于名称的稳健查找
+        3. 在 Dendrites 上创建突触 (排除 Soma)
+        """
+        self.segments = []
+        self.synapses = []
+
+        # 1. 收集所有 Section
+        # L5PCtemplate 提供的引用
+        all_sections = []
+        soma_sections = list(self.cell.soma)
+        dend_sections = list(self.cell.dend)
+        apic_sections = list(self.cell.apic)
+
+        # 顺序：Soma -> Basal -> Apical
+        all_sections = soma_sections + dend_sections + apic_sections
+
+        # 2. 展平为 Segments 并建立索引
+        # 我们需要一个稳健的查找表：{section_name: [global_seg_indices]}
+        sec_name_to_indices = {}
+
+        for sec in all_sections:
+            sec_name = sec.name()
+            sec_name_to_indices[sec_name] = []
+
+            for seg in sec:
+                global_idx = len(self.segments)
+                self.segments.append(seg)
+                sec_name_to_indices[sec_name].append(global_idx)
+
+        print(f"Total segments collected: {len(self.segments)}")
+
+        # 3. 构建拓扑结构 (Parent Indices)
+        self.parent_indices = np.zeros(len(self.segments), dtype=np.int32)
+
+        for i, seg in enumerate(self.segments):
+            sec = seg.sec
+            sec_name = sec.name()
+
+            # 检查是否是该 Section 的第一个 Segment
+            # 逻辑：比较当前全局索引是否等于该 Section 记录的第一个索引
+            is_first_seg = (i == sec_name_to_indices[sec_name][0])
+
+            if not is_first_seg:
+                # 内部连接：父节点就是前一个索引
+                self.parent_indices[i] = i - 1
+            else:
+                # Section 头部：寻找 Section 的父级
+                parent_seg = sec.parentseg()
+
+                if parent_seg is None:
+                    # 真正的物理根节点 (通常是 Soma[0])
+                    self.parent_indices[i] = -1
+                else:
+                    # 查找 Parent Segment 的全局索引
+                    # 难点：parent_seg 是一个新对象，不能直接查字典
+                    # 解决：通过 Section 名字和 x 坐标 (位置) 来匹配
+                    p_sec_name = parent_seg.sec.name()
+                    p_x = parent_seg.x
+
+                    if p_sec_name in sec_name_to_indices:
+                        # 获取父 Section 包含的所有全局索引
+                        candidate_indices = sec_name_to_indices[p_sec_name]
+
+                        # 在这些候选者中，找到位置 x 最接近 p_x 的那个
+                        # (NEURON 的 parentseg 通常连接到父 segment 的中心)
+                        best_idx = -1
+                        min_dist = 1.0
+
+                        for idx in candidate_indices:
+                            c_seg = self.segments[idx]
+                            dist = abs(c_seg.x - p_x)
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_idx = idx
+
+                        self.parent_indices[i] = best_idx
+                    else:
+                        # 父节点不在记录的列表里 (比如连到了 Axon，如果我们没包含 Axon)
+                        # 在 L5PC 中，Dend/Apic 都连在 Soma，Soma 在列表里，所以这里应该安全
+                        print(f"Warning: Parent section {p_sec_name} not found for {sec_name}")
+                        self.parent_indices[i] = -1
+
+        # 4. 布置突触 (排除 Soma)
+        # 策略：只在 Basal 和 Apical 上放突触
+        self.input_map = []
+        self.synapse_types = []
+
+        # 辅助集合用于快速判断
+        # 注意：这里判断 Section 对象是否属于 soma 列表
+        soma_sec_set = set(soma_sections)
+
+        # 定义辅助函数创建突触 (保持你修改后的版本)
+        def create_synapse(seg, syn_type):
+            syn = None
+            if syn_type == 'AMPA_NMDA':
+                if hasattr(h, 'ProbAMPANMDA_EMS'):
+                    syn = h.ProbAMPANMDA_EMS(seg)
+                elif hasattr(h, 'ProbAMPANMDA2'):
+                    syn = h.ProbAMPANMDA2(seg)
+                if syn is None: raise RuntimeError("Mechanism not found")
+                if hasattr(syn, 'tau_r_AMPA'):
+                    syn.tau_r_AMPA = 0.3;
+                    syn.tau_d_AMPA = 3.0
+                    syn.tau_r_NMDA = 2.0;
+                    syn.tau_d_NMDA = 70.0
+                if hasattr(syn, 'gmax'):
+                    syn.gmax = self.cfg.SYN_GMAX_NMDA
+                elif hasattr(syn, 'gMax'):
+                    syn.gMax = self.cfg.SYN_GMAX_NMDA
+            elif syn_type == 'GABA_A':
+                if hasattr(h, 'ProbGABAAB_EMS'):
+                    syn = h.ProbGABAAB_EMS(seg)
+                elif hasattr(h, 'ProbUDFsyn2'):
+                    syn = h.ProbUDFsyn2(seg)
+                if syn is None: raise RuntimeError("Mechanism not found")
+                if hasattr(syn, 'tau_r_GABAA'):
+                    syn.tau_r_GABAA = 0.2;
+                    syn.tau_d_GABAA = 8.0;
+                    syn.e_GABAA = -80.0
+                    syn.tau_r_GABAB = 3.5;
+                    syn.tau_d_GABAB = 260.9;
+                    syn.e_GABAB = -97.0
+                    if hasattr(syn, 'GABAB_ratio'): syn.GABAB_ratio = 0.0
+                elif hasattr(syn, 'tau_r'):
+                    syn.tau_r = 0.2;
+                    syn.tau_d = 8.0;
+                    syn.e = -80.0
+                if hasattr(syn, 'gmax'):
+                    syn.gmax = self.cfg.SYN_GMAX_GABA
+                elif hasattr(syn, 'gMax'):
+                    syn.gMax = self.cfg.SYN_GMAX_GABA
+            try:
+                syn.Use = 1.0;
+                syn.u0 = 0.0;
+                syn.Dep = 0.0;
+                syn.Fac = 0.0
+            except:
+                pass
+            return syn
+
+        for i, seg in enumerate(self.segments):
+            # 关键修改：如果是 Soma，则跳过添加突触
+            if seg.sec in soma_sec_set:
+                continue
+
+            # 1. Add Excitatory Synapse
+            syn_ex = create_synapse(seg, 'AMPA_NMDA')
+            self.synapses.append(syn_ex)
+            self.input_map.append(i)  # 记录映射到哪个全局 segment
+            self.synapse_types.append(1)
+
+            # 2. Add Inhibitory Synapse
+            syn_inh = create_synapse(seg, 'GABA_A')
+            self.synapses.append(syn_inh)
+            self.input_map.append(i)
+            self.synapse_types.append(-1)
+
+        # 转换为 numpy 数组
+        self.input_map = np.array(self.input_map, dtype=np.int32)
+        self.synapse_types = np.array(self.synapse_types, dtype=np.int8)
+
+        print(f"Model Setup Complete: {len(self.segments)} segments, {len(self.synapses)} synapses.")
+        # 验证数量
+        expected_synapses = (len(self.segments) - 1) * 2  # 假设 Soma 只有1个 segment
+        if len(self.synapses) != expected_synapses:
+            # 如果 Soma 不止一个 segment，或者 dend/apic 计数有误，这里会提示
+            # 但对于 L5PC，通常 segments=640, soma=1, 预期 639*2 = 1278
+            pass
+
+        # 5. 预创建所有 NetCon (关键修改)
+        self.netcons = []
+        for syn in self.synapses:
+            # 使用 None 作为源，表示我们将手动通过 nc.event() 发送脉冲
+            nc = h.NetCon(None, syn)
+            nc.weight[0] = 1.0
+            nc.delay = 0.0
+            self.netcons.append(nc)
+
+        print(f"Model Setup Complete: {len(self.segments)} segments, {len(self.synapses)} synapses and NetCons.")
+
+    def get_static_metadata(self):
+        """返回用于写入 HDF5 /static_info 的字典"""
+        return {
+            "num_subunits": len(self.segments),
+            "parent_indices": self.parent_indices,
+            "input_map": self.input_map,
+            "synapse_types": self.synapse_types,
+            "dt": self.cfg.DT,
+            "total_time": int((self.cfg.T_SETTLE + self.cfg.T_RECORD) / self.cfg.DT)
+        }
+
+    def _warmup(self):
+        """
+        执行一次长时仿真以达到稳态，并保存状态。
+        """
+        print("Performing warmup to reach steady state...")
+
+        # 1. 初始化
+        h.finitialize(self.cfg.V_INIT)
+
+        # 2. 跑足够长的时间 (3000ms 足够让最慢的 Ih 通道平衡)
+        h.continuerun(3000.0)
+
+        # 3. 检查当前电压
+        v_soma = self.cell.soma[0](0.5).v
+        print(f"Warmup complete. Steady state voltage: {v_soma:.4f} mV")
+
+        # 4. 保存状态
+        self.savestate = h.SaveState()
+        self.savestate.save()
+        print("System state saved.")
+
+    def run_simulation(self, active_synapse_indices):
+        """
+        运行单次模拟 (使用 SaveState 加速)
+        """
+        total_duration = self.cfg.T_SETTLE + self.cfg.T_RECORD
+        total_steps = int(total_duration / self.cfg.DT) + 1
+        stim_time_abs = self.cfg.T_SETTLE + self.cfg.STIM_DELAY
+
+        # 1. 设置记录器 (保持不变)
+        t_vec = h.Vector()
+        t_vec.record(h._ref_t)
+        v_vec = h.Vector()
+        v_vec.record(self.cell.soma[0](0.5)._ref_v)
+
+        # 2. 恢复状态 (注意：此时内存中的 NetCon 数量与 SaveState 记录的一致)
+        h.finitialize(self.cfg.V_INIT)
+        self.savestate.restore()
+
+        # 强制重置时间与状态
+        h.t = 0.0
+        h.tstop = total_duration
+        h.fcurrent()
+
+        # 3. 发送事件 (关键修改：直接使用 self.netcons)
+        for syn_idx in active_synapse_indices:
+            self.netcons[syn_idx].event(stim_time_abs)
+
+        # 4. 运行
+        h.continuerun(total_duration)
+
+        # 5. 数据处理
+        v_trace = np.array(v_vec.to_python(), dtype=np.float32)
+
+        if len(v_trace) > total_steps:
+            v_trace = v_trace[:total_steps]
+        elif len(v_trace) < total_steps:
+            pad_width = total_steps - len(v_trace)
+            v_trace = np.pad(v_trace, (0, pad_width), 'edge')
+
+        num_synapses = len(self.synapses)
+        input_matrix = np.zeros((total_steps, num_synapses), dtype=np.uint8)
+
+        stim_step_idx = int(stim_time_abs / self.cfg.DT)
+        if 0 <= stim_step_idx < total_steps:
+            for syn_idx in active_synapse_indices:
+                input_matrix[stim_step_idx, syn_idx] = 1
+
+        return input_matrix, v_trace.reshape(-1, 1)
+
+
+# ==========================================
+# 3. HDF5 管理器 (The Data Writer)
+# ==========================================
+class H5_Manager:
+    def __init__(self, filepath, config):
+        self.filepath = filepath
+        self.cfg = config
+        self.f = None
+        self.dsets = {}  # 保存 dataset 对象的引用
+
+    def initialize_file(self, static_metadata, total_sim_steps, num_synapses):
+        """
+        创建 HDF5 文件结构，写入静态信息
+        如果文件存在，且结构匹配，则追加；否则覆盖 (或报错)
+        """
+        # 使用 'a' 模式：读/写，如果不存在则创建
+        self.f = h5py.File(self.filepath, 'a')
+
+        # 1. 写入 /static_info (仅当不存在时)
+        if 'static_info' not in self.f:
+            static_grp = self.f.create_group('static_info')
+            for key, value in static_metadata.items():
+                static_grp.create_dataset(key, data=value)
+
+            # 写入根属性
+            self.f.attrs['neuron_name'] = "L5PC"
+            self.f.attrs['dt'] = static_metadata['dt']
+            self.f.attrs['total_time'] = static_metadata['total_time']
+            self.f.attrs['num_synapses'] = num_synapses
+
+            print(f"Initialized new HDF5 file: {self.filepath}")
+        else:
+            print(f"Opened existing HDF5 file: {self.filepath}")
+
+        # 2. 准备动态数据集 /dataset
+        if 'dataset' not in self.f:
+            dset_grp = self.f.create_group('dataset')
+
+            # A. inputs (输入脉冲矩阵)
+            # Shape: (Sample_Count, Time_Steps, Num_Synapses)
+            # Chunking: 强制以 (1, Time, Synapses) 为单位，优化单样本读取
+            dset_grp.create_dataset(
+                'inputs',
+                shape=(0, total_sim_steps, num_synapses),
+                maxshape=(None, total_sim_steps, num_synapses),
+                dtype='uint8',
+                compression=self.cfg.COMPRESSION,
+                compression_opts=self.cfg.COMPRESSION_OPTS,
+                chunks=(1, total_sim_steps, num_synapses)
+            )
+
+            # B. targets (输出膜电位)
+            # Shape: (Sample_Count, Time_Steps, 1)
+            # Chunking: (1, Time, 1)
+            dset_grp.create_dataset(
+                'targets',
+                shape=(0, total_sim_steps, 1),
+                maxshape=(None, total_sim_steps, 1),
+                dtype='float32',
+                compression=self.cfg.COMPRESSION,
+                compression_opts=self.cfg.COMPRESSION_OPTS,
+                chunks=(1, total_sim_steps, 1)
+            )
+
+        # 保存 dataset 引用以便快速写入
+        self.dsets['inputs'] = self.f['dataset']['inputs']
+        self.dsets['targets'] = self.f['dataset']['targets']
+
+    def append_data(self, inputs_batch, targets_batch):
+        """
+        将一批数据写入文件
+        inputs_batch: (Batch, Time, Synapses) - uint8
+        targets_batch: (Batch, Time, 1) - float32
+        """
+        # 确保文件是打开的
+        if not self.f:
+            raise RuntimeError("HDF5 file is not initialized.")
+
+        # 获取当前样本数
+        current_size = self.dsets['inputs'].shape[0]
+        batch_size = inputs_batch.shape[0]
+        new_size = current_size + batch_size
+
+        # 1. Resize 数据集以容纳新数据
+        self.dsets['inputs'].resize(new_size, axis=0)
+        self.dsets['targets'].resize(new_size, axis=0)
+
+        # 2. 写入新数据
+        self.dsets['inputs'][current_size:new_size] = inputs_batch
+        self.dsets['targets'][current_size:new_size] = targets_batch
+
+        # 3. Flush 确保数据落盘 (防止程序中途崩溃导致数据丢失)
+        self.f.flush()
+
+    def close(self):
+        if self.f:
+            self.f.close()
+            print("HDF5 file closed.")
+
+
+# ==========================================
+# 4. 主执行逻辑 (Main Execution)
+# ==========================================
+def main():
+    # 1. 解析命令行参数
+    parser = argparse.ArgumentParser(description="L5PC Parallel Simulation")
+    parser.add_argument("--job_id", type=int, default=0, help="当前任务ID (0-indexed)")
+    parser.add_argument("--total_jobs", type=int, default=1, help="总并行任务数")
+    parser.add_argument("--mode", type=str, choices=['setup', 'pairs'], default='setup',
+                        help="运行模式: 'setup' (跑Phase0+1) 或 'pairs' (跑Phase2)")
+    parser.add_argument("--batch_size", type=int, default=50, help="H5写入批次大小")
+    args = parser.parse_args()
+
+    cfg = Config()
+
+    # 2. 动态设置输出文件名
+    # setup 模式: L5PC_setup.h5
+    # pairs 模式: L5PC_pairs_part_X.h5
+    if args.mode == 'setup':
+        cfg.OUTPUT_FILE = "L5PC_setup.h5"
+        print(f"=== Running Mode: SETUP (Phase 0 & 1) ===")
     else:
-        dendritesKind += '_Ih_vshift_%d_SKE2_mult_%d' %(Ih_vshift, 100 * SKE2_mult_factor)
-        
-    modelString = cellType + '__' + dendritesKind + '__' + synapseTypes
-    dirToSaveIn = resultsSavedIn_rootFolder + modelString + '//'
-    
-    # string to describe input
-    string1 = 'exBas_%d_%d_inhBasDiff_%d_%d' %(num_bas_ex_spikes_per_100ms_range[0],num_bas_ex_spikes_per_100ms_range[1],
-                                               num_bas_ex_inh_spike_diff_per_100ms_range[0],num_bas_ex_inh_spike_diff_per_100ms_range[1])
-    string2 = 'exApic_%d_%d_inhApicDiff_%d_%d' %(num_apic_ex_spikes_per_100ms_range[0],num_apic_ex_spikes_per_100ms_range[1],
-                                                 num_apic_ex_inh_spike_diff_per_100ms_range[0],num_apic_ex_inh_spike_diff_per_100ms_range[1])
-    inputString = string1 + '__' + string2
-    
-    # string to describe simulation
-    savedDVTs = ''
-    if collectAndSaveDVTs:
-        savedDVTs = 'DVTs'
-    
-    string3 = 'saved_InputSpikes_%s__%d_outSpikes__%d_simulationRuns__%d_secDuration__randomSeed_%d'
-    simulationString = string3 %(savedDVTs, numOutputSpikes, numSimulations,totalSimDurationInSec, randomSeed)
-                  
-    filenameToSave = inputString + '__' + simulationString + '.p'
-                 
-    return dirToSaveIn, filenameToSave
-
-
-def GetDistanceBetweenSections(sourceSection, destSection):
-    h.distance(sec=sourceSection)
-    return h.distance(0, sec=destSection)
-
-
-# AMPA synapse
-def DefineSynapse_AMPA(segment, gMax=0.0004):
-    synapse = h.ProbUDFsyn2(segment)
-
-    synapse.tau_r = 0.3
-    synapse.tau_d = 3.0
-    synapse.gmax = gMax
-    synapse.e = 0
-    synapse.Use = 1
-    synapse.u0 = 0
-    synapse.Dep = 0
-    synapse.Fac = 0
-
-    return synapse
-
-
-# NMDA synapse
-def DefineSynapse_NMDA(segment, gMax=0.0004):
-    synapse = h.ProbAMPANMDA2(segment)
-
-    synapse.tau_r_AMPA = 0.3
-    synapse.tau_d_AMPA = 3.0
-    synapse.tau_r_NMDA = 2.0
-    synapse.tau_d_NMDA = 70.0
-    synapse.gmax = gMax
-    synapse.e = 0
-    synapse.Use = 1
-    synapse.u0 = 0
-    synapse.Dep = 0
-    synapse.Fac = 0
-
-    return synapse
-
-
-# GABA A synapse
-def DefineSynapse_GABA_A(segment, gMax=0.001):
-    synapse = h.ProbUDFsyn2(segment)
-
-    synapse.tau_r = 0.2
-    synapse.tau_d = 8
-    synapse.gmax = gMax
-    synapse.e = -80
-    synapse.Use = 1
-    synapse.u0 = 0
-    synapse.Dep = 0
-    synapse.Fac = 0
-
-    return synapse
-
-
-# GABA B synapse
-def DefineSynapse_GABA_B(segment, gMax=0.001):
-    synapse = h.ProbUDFsyn2(segment)
-
-    synapse.tau_r = 3.5
-    synapse.tau_d = 260.9
-    synapse.gmax = gMax
-    synapse.e = -97
-    synapse.Use = 1
-    synapse.u0 = 0
-    synapse.Dep = 0
-    synapse.Fac = 0
-
-    return synapse
-
-
-# GABA A+B synapse
-def DefineSynapse_GABA_AB(segment, gMax=0.001):
-    synapse = h.ProbGABAAB_EMS(segment)
-
-    synapse.tau_r_GABAA = 0.2
-    synapse.tau_d_GABAA = 8
-    synapse.tau_r_GABAB = 3.5
-    synapse.tau_d_GABAB = 260.9
-    synapse.gmax = gMax
-    synapse.e_GABAA = -80
-    synapse.e_GABAB = -97
-    synapse.GABAB_ratio = 0.0
-    synapse.Use = 1
-    synapse.u0 = 0
-    synapse.Dep = 0
-    synapse.Fac = 0
-
-    return synapse
-
-
-def ConnectEmptyEventGenerator(synapse):
-
-    netConnection = h.NetCon(None,synapse)
-    netConnection.delay = 0
-    netConnection.weight[0] = 1
-
-    return netConnection
-
-
-# create a single image of both excitatory and inhibitory spikes and the dendritic voltage traces
-def CreateCombinedColorImage(dendriticVoltageTraces, excitatoryInputSpikes, inhibitoryInputSpikes):
-    minV = -85
-    maxV = 35
-    
-    excitatoryInputSpikes = signal.fftconvolve(excitatoryInputSpikes, np.ones((3,3)), mode='same')
-    inhibitoryInputSpikes = signal.fftconvolve(inhibitoryInputSpikes, np.ones((3,3)), mode='same')
-    
-    stimulationImage = np.zeros((np.shape(excitatoryInputSpikes)[0],np.shape(excitatoryInputSpikes)[1],3))
-    stimulationImage[:,:,0] = 0.98 * (dendriticVoltageTraces - minV) / (maxV - minV) + inhibitoryInputSpikes
-    stimulationImage[:,:,1] = 0.98 * (dendriticVoltageTraces - minV) / (maxV - minV) + excitatoryInputSpikes
-    stimulationImage[:,:,2] = 0.98 * (dendriticVoltageTraces - minV) / (maxV - minV)
-    stimulationImage[stimulationImage > 1] = 1
-
-    return stimulationImage
-
-
-#%% define NEURON model
-
-h.load_file('nrngui.hoc')
-h.load_file("import3d.hoc")
-
-morphologyFilename = "L5PC_NEURON_simulation/morphologies/cell1.asc"
-biophysicalModelFilename = "L5PC_NEURON_simulation/L5PCbiophys5b.hoc"
-biophysicalModelTemplateFilename = "L5PC_NEURON_simulation/L5PCtemplate_2.hoc"
-
-# maybe a problem
-h.celsius = 34.0
-
-h.load_file(biophysicalModelFilename)
-h.load_file(biophysicalModelTemplateFilename)
-L5PC = h.L5PCtemplate(morphologyFilename)
-
-cvode = h.CVode()
-if useCvode:
-    cvode.active(1)
-
-#%% collect everything we need about the model
-
-# Get a list of all sections
-listOfBasalSections  = [L5PC.dend[x] for x in range(len(L5PC.dend))]
-listOfApicalSections = [L5PC.apic[x] for x in range(len(L5PC.apic))]
-allSections = listOfBasalSections + listOfApicalSections
-allSectionsType = ['basal' for x in listOfBasalSections] + ['apical' for x in listOfApicalSections]
-allSectionsLength = []
-allSections_DistFromSoma = []
-
-allSegments = []
-allSegmentsLength = []
-allSegmentsType = []
-allSegments_DistFromSoma = []
-allSegments_SectionDistFromSoma = []
-allSegments_SectionInd = []
-# get a list of all segments
-for k, section in enumerate(allSections):
-    allSectionsLength.append(section.L)
-    allSections_DistFromSoma.append(GetDistanceBetweenSections(L5PC.soma[0], section))
-    for currSegment in section:
-        allSegments.append(currSegment)
-        allSegmentsLength.append(float(section.L) / section.nseg)
-        allSegmentsType.append(allSectionsType[k])
-        allSegments_DistFromSoma.append(GetDistanceBetweenSections(L5PC.soma[0], section) + float(section.L) * currSegment.x)
-        allSegments_SectionDistFromSoma.append(GetDistanceBetweenSections(L5PC.soma[0], section))
-        allSegments_SectionInd.append(k)
-
-
-# set Ih vshift value and SK multiplicative factor
-for section in allSections:
-    section.vshift_Ih = Ih_vshift
-L5PC.soma[0].vshift_Ih = Ih_vshift
-
-list_of_axonal_sections = [L5PC.axon[x] for x in range(len(L5PC.axon))]
-list_of_somatic_sections = [L5PC.soma[x] for x in range(len(L5PC.soma))]
-all_sections_with_SKE2 = list_of_somatic_sections + list_of_axonal_sections + listOfApicalSections
-
-for section in all_sections_with_SKE2:
-    orig_SKE2_g = section.gSK_E2bar_SK_E2
-    new_SKE2_g = orig_SKE2_g * SKE2_mult_factor
-    section.gSK_E2bar_SK_E2 = new_SKE2_g
-    #print('SKE2 conductance before update = %.10f' %(orig_SKE2_g))
-    #print('SKE2 conductance after  update = %.10f (actual)' %(section.gSK_E2bar_SK_E2))
-
-# Calculate total dendritic length
-numBasalSegments = 0
-numApicalSegments = 0
-totalBasalDendriticLength = 0
-totalApicalDendriticLength = 0
-
-basal_seg_length_um = []
-apical_seg_length_um = []
-for k, segmentLength in enumerate(allSegmentsLength):
-    if allSegmentsType[k] == 'basal':
-        basal_seg_length_um.append(segmentLength)
-        totalBasalDendriticLength += segmentLength
-        numBasalSegments += 1
-    if allSegmentsType[k] == 'apical':
-        apical_seg_length_um.append(segmentLength)
-        totalApicalDendriticLength += segmentLength
-        numApicalSegments += 1
-
-totalDendriticLength = sum(allSectionsLength)
-totalNumSegments = len(allSegments)
-
-# extract basal and apical segment lengths
-num_basal_segments  = len(basal_seg_length_um)
-num_apical_segments = len(apical_seg_length_um)
-
-basal_seg_length_um = np.array(basal_seg_length_um)
-apical_seg_length_um = np.array(apical_seg_length_um)
-
-assert(totalNumSegments == (numBasalSegments + numApicalSegments))
-assert(abs(totalDendriticLength - (totalBasalDendriticLength + totalApicalDendriticLength)) < 0.00001)
-
-totalNumOutputSpikes = 0
-numOutputSpikesPerSim = []
-listOfISIs = []
-listOfSingleSimulationDicts = []
-
-## run all simulations
-experimentStartTime = time.time()
-print('-------------------------------------\\')
-print('temperature is %.2f degrees celsius' %(h.celsius))
-print('dt is %.4f ms' %(h.dt))
-print('-------------------------------------/')
-for simInd in range(numSimulations):
-    currSimulationResultsDict = {}
-    preparationStartTime = time.time()
-    print('...')
-    print('------------------------------------------------------------------------------\\')
-
-
-    ex_spikes_bin, inh_spikes_bin = generate_input_spike_trains_for_simulation(sim_duration_ms,
-                                                                               basal_seg_length_um,
-                                                                               apical_seg_length_um,
-                                                                               min_seg_length_um,
-                                                                               num_bas_ex_spikes_per_100ms_range,
-                                                                               num_apic_ex_spikes_per_100ms_range,
-                                                                               num_bas_ex_inh_spike_diff_per_100ms_range,
-                                                                               num_apic_ex_inh_spike_diff_per_100ms_range,
-                                                                               inst_rate_sampling_time_interval_options_ms,
-                                                                               temporal_inst_rate_smoothing_sigma_options_ms)
-
-    inputSpikeTrains_ex  = ex_spikes_bin
-    inputSpikeTrains_inh = inh_spikes_bin
-        
-    ## convert binary vectors to dict of spike times for each seg ind
-    exSpikeSegInds, exSpikeTimes = np.nonzero(inputSpikeTrains_ex)
-    exSpikeTimesMap = {}
-    for segInd, synTime in zip(exSpikeSegInds,exSpikeTimes):
-        if segInd in exSpikeTimesMap.keys():
-            exSpikeTimesMap[segInd].append(synTime)
-        else:
-            exSpikeTimesMap[segInd] = [synTime]
-    
-    inhSpikeSegInds, inhSpikeTimes = np.nonzero(inputSpikeTrains_inh)
-    inhSpikeTimesMap = {}
-    for segInd, synTime in zip(inhSpikeSegInds,inhSpikeTimes):
-        if segInd in inhSpikeTimesMap.keys():
-            inhSpikeTimesMap[segInd].append(synTime)
-        else:
-            inhSpikeTimesMap[segInd] = [synTime]
-    
-    
-    ## run simulation ########################
-    allExNetCons = []
-    allExNetConEventLists = []
-    
-    allInhNetCons = []
-    allInhNetConEventLists = []
-    
-    allExSynapses = []
-    allInhSynapses = []
-    
-    for segInd, segment in enumerate(allSegments):
-        ###### excitation ######
-    
-        # define synapse and connect it to a segment
-        if excitatorySynapseType == 'AMPA':
-            exSynapse = DefineSynapse_AMPA(segment)
-        elif excitatorySynapseType == 'NMDA':
-            exSynapse = DefineSynapse_NMDA(segment)
-        else:
-            assert False, 'Not supported Excitatory Synapse Type'
-        allExSynapses.append(exSynapse)
-    
-        # connect synapse
-        netConnection = h.NetCon(None,exSynapse)
-        netConnection.delay = 0
-        netConnection.weight[0] = 1
-    
-        # update lists
-        allExNetCons.append(netConnection)
-        if segInd in exSpikeTimesMap.keys():
-            allExNetConEventLists.append(exSpikeTimesMap[segInd])
-        else:
-            allExNetConEventLists.append([])
-            
-        ###### inhibition ######
-    
-        # define synapse and connect it to a segment
-        if inhibitorySynapseType == 'GABA_A':
-            inhSynapse = DefineSynapse_GABA_A(segment)
-        elif inhibitorySynapseType == 'GABA_B':
-            inhSynapse = DefineSynapse_GABA_B(segment)
-        elif inhibitorySynapseType == 'GABA_AB':
-            inhSynapse = DefineSynapse_GABA_AB(segment)
-        else:
-            assert False, 'Not supported Inhibitory Synapse Type'
-        allInhSynapses.append(inhSynapse)
-    
-        # connect synapse
-        netConnection = ConnectEmptyEventGenerator(inhSynapse)
-    
-        # update lists
-        allInhNetCons.append(netConnection)
-        if segInd in inhSpikeTimesMap.keys():
-            allInhNetConEventLists.append(inhSpikeTimesMap[segInd])
-        else:
-            allInhNetConEventLists.append([])  # insert empty list if no event
-    
-    # define function to be run at the begining of the simulation to add synaptic events
-    def AddAllSynapticEvents():
-        for exNetCon, eventsList in zip(allExNetCons,allExNetConEventLists):
-            for eventTime in eventsList:
-                exNetCon.event(eventTime)
-        for inhNetCon, eventsList in zip(allInhNetCons,allInhNetConEventLists):
-            for eventTime in eventsList:
-                inhNetCon.event(eventTime)
-
-    # add voltage and time recordings
-                
-    # record time
-    recTime = h.Vector()
-    recTime.record(h._ref_t)
-    
-    # record soma voltage
-    recVoltageSoma = h.Vector()
-    recVoltageSoma.record(L5PC.soma[0](0.5)._ref_v)
-    
-    # record nexus voltage
-    nexusSectionInd = 50
-    recVoltageNexus = h.Vector()
-    recVoltageNexus.record(L5PC.apic[nexusSectionInd](0.9)._ref_v)
-    
-    # record all segments voltage
-    if collectAndSaveDVTs:
-        recVoltage_allSegments = []
-        for segInd, segment in enumerate(allSegments):
-            voltageRecSegment = h.Vector()
-            voltageRecSegment.record(segment._ref_v)
-            recVoltage_allSegments.append(voltageRecSegment)
-        
-    preparationDurationInSeconds = time.time() - preparationStartTime
-    print("preparing for single simulation took %.4f seconds" % (preparationDurationInSeconds))
-
-
-    ## simulate the cell
-    simulationStartTime = time.time()
-    # make sure the following line will be run after h.finitialize()
-    fih = h.FInitializeHandler('nrnpython("AddAllSynapticEvents()")')
-    h.finitialize(-76)
-    neuron.run(totalSimDurationInMS)
-    singleSimulationDurationInMinutes = (time.time() - simulationStartTime) / 60
-    print("single simulation took %.2f minutes" % (singleSimulationDurationInMinutes))
-
-    ## extract the params from the simulation
-    # collect all relevent recoding vectors (input spike times, dendritic voltage traces, soma voltage trace)
-    collectionStartTime = time.time()
-        
-    origRecordingTime = np.array(recTime.to_python())
-    origSomaVoltage   = np.array(recVoltageSoma.to_python())
-    origNexusVoltage  = np.array(recVoltageNexus.to_python())
-    
-    # high res - origNumSamplesPerMS per ms
-    recordingTimeHighRes = np.arange(0, totalSimDurationInMS, 1.0 / numSamplesPerMS_HighRes)
-    somaVoltageHighRes   = np.interp(recordingTimeHighRes, origRecordingTime, origSomaVoltage)
-    nexusVoltageHighRes  = np.interp(recordingTimeHighRes, origRecordingTime, origNexusVoltage)
-
-    # low res - 1 sample per ms
-    recordingTimeLowRes = np.arange(0,totalSimDurationInMS)
-    somaVoltageLowRes   = np.interp(recordingTimeLowRes, origRecordingTime, origSomaVoltage)
-    nexusVoltageLowRes  = np.interp(recordingTimeLowRes, origRecordingTime, origNexusVoltage)
-    
-    if collectAndSaveDVTs:
-        dendriticVoltages = np.zeros((len(recVoltage_allSegments),recordingTimeLowRes.shape[0]))
-        for segInd, recVoltageSeg in enumerate(recVoltage_allSegments):
-            dendriticVoltages[segInd,:] = np.interp(recordingTimeLowRes, origRecordingTime, np.array(recVoltageSeg.to_python()))
-
-    # detect soma spike times
-    risingBefore = np.hstack((0, somaVoltageHighRes[1:] - somaVoltageHighRes[:-1])) > 0
-    fallingAfter = np.hstack((somaVoltageHighRes[1:] - somaVoltageHighRes[:-1], 0)) < 0
-    localMaximum = np.logical_and(fallingAfter, risingBefore)
-    largerThanThresh = somaVoltageHighRes > -25
-    
-    binarySpikeVector = np.logical_and(localMaximum,largerThanThresh)
-    spikeInds = np.nonzero(binarySpikeVector)
-    outputSpikeTimes = recordingTimeHighRes[spikeInds]
-    
-    currSimulationResultsDict['recordingTimeHighRes'] = recordingTimeHighRes.astype(np.float32)
-    currSimulationResultsDict['somaVoltageHighRes']   = somaVoltageHighRes.astype(np.float16)
-    currSimulationResultsDict['nexusVoltageHighRes']  = nexusVoltageHighRes.astype(np.float16)
-    
-    currSimulationResultsDict['recordingTimeLowRes'] = recordingTimeLowRes.astype(np.float32)
-    currSimulationResultsDict['somaVoltageLowRes']   = somaVoltageLowRes.astype(np.float16)
-    currSimulationResultsDict['nexusVoltageLowRes']  = nexusVoltageLowRes.astype(np.float16)
-
-    currSimulationResultsDict['exInputSpikeTimes']  = exSpikeTimesMap
-    currSimulationResultsDict['inhInputSpikeTimes'] = inhSpikeTimesMap
-    currSimulationResultsDict['outputSpikeTimes']   = outputSpikeTimes.astype(np.float16)
-    
-    if collectAndSaveDVTs:
-        currSimulationResultsDict['dendriticVoltagesLowRes'] = dendriticVoltages.astype(np.float16)
-        
-    numOutputSpikes = len(outputSpikeTimes)
-    numOutputSpikesPerSim.append(numOutputSpikes)
-    listOfISIs += list(np.diff(outputSpikeTimes))
-    
-    listOfSingleSimulationDicts.append(currSimulationResultsDict)
-    
-    dataCollectionDurationInSeconds = (time.time() - collectionStartTime)
-    print("data collection per single simulation took %.4f seconds" % (dataCollectionDurationInSeconds))
-    
-    entireSimulationDurationInMinutes = (time.time() - preparationStartTime) / 60
-    print('-----------------------------------------------------------')
-    print('finished simulation %d: num output spikes = %d' %(simInd + 1, numOutputSpikes))
-    print("entire simulation took %.2f minutes" % (entireSimulationDurationInMinutes))
-    print('------------------------------------------------------------------------------/')
-
-    # show the results
-    if collectAndSaveDVTs and showPlots:
-        import matplotlib.pyplot as plt
-        #plt.close('all')
-        plt.figure(figsize=(30,15))
-        plt.subplot(2,1,1); plt.title('input spike trains')
-        plt.imshow(CreateCombinedColorImage(dendriticVoltages, inputSpikeTrains_ex, inputSpikeTrains_inh))
-        
-        plt.subplot(2,1,2); plt.title('interpulated time - high res')
-        plt.plot(recordingTimeHighRes, somaVoltageHighRes)
-        plt.plot(recordingTimeHighRes, nexusVoltageHighRes)
-        plt.xlim(0,totalSimDurationInMS)
-        plt.ylabel('Voltage [mV]'); plt.legend(['soma','nexus'])
-    
-        plt.figure(figsize=(30,15))
-        plt.subplot(3,1,1); plt.title('dendritic voltage traces - low res')
-        for segInd in range(len(recVoltage_allSegments)):
-            plt.plot(recordingTimeLowRes, dendriticVoltages[segInd,:])
-        plt.ylabel('Voltage [mV]')
-        
-        plt.subplot(3,1,2); plt.title('interpulated time - low res')
-        plt.plot(recordingTimeLowRes, somaVoltageLowRes)
-        plt.plot(recordingTimeLowRes, nexusVoltageLowRes)
-        plt.xlabel('time [msec]'); plt.ylabel('Voltage [mV]'); plt.legend(['soma','nexus','soma LowRes','nexus LowRes'])
-        
-        plt.subplot(3,1,3); plt.title('voltage histogram')
-        plt.hist(somaVoltageHighRes.ravel() , normed=True, bins=200, color='b', alpha=0.7)
-        plt.hist(nexusVoltageHighRes.ravel(), normed=True, bins=200, color='r', alpha=0.7)
-        plt.xlabel('Voltage [mV]'); plt.legend(['soma','nexus'])
-
-
-#%% all simulations have ended, pring some statistics
-
-totalNumOutputSpikes = sum(numOutputSpikesPerSim)
-totalNumSimulationSeconds = totalSimDurationInSec * numSimulations
-averageOutputFrequency = totalNumOutputSpikes / float(totalNumSimulationSeconds)
-ISICV = np.std(listOfISIs) / np.mean(listOfISIs)
-entireExperimentDurationInMinutes = (time.time() - experimentStartTime) / 60
-                            
-# calculate some collective meassures of the experiment
-print('-------------------------------------------------\\')
-print("entire experiment took %.2f minutes" % (entireExperimentDurationInMinutes))
-print('-----------------------------------------------')
-print('total number of collected spikes is ' + str(totalNumOutputSpikes))
-print('average output frequency is %.2f [Hz]' % (averageOutputFrequency))
-print('number of spikes per simulation minute is %.2f' % (totalNumOutputSpikes / entireExperimentDurationInMinutes))
-print('ISI-CV is ' + str(ISICV))
-print('-------------------------------------------------/')
-sys.stdout.flush()
-
-#%% organize and save everything
-
-
-# create a simulation parameters dict
-experimentParams = {}
-experimentParams['randomSeed']     = randomSeed
-experimentParams['numSimulations'] = numSimulations
-experimentParams['totalSimDurationInSec']   = totalSimDurationInSec
-experimentParams['collectAndSaveDVTs']      = collectAndSaveDVTs
-experimentParams['numSamplesPerMS_HighRes'] = numSamplesPerMS_HighRes
-experimentParams['excitatorySynapseType']   = excitatorySynapseType
-experimentParams['inhibitorySynapseType']   = inhibitorySynapseType
-experimentParams['useActiveDendrites']      = useActiveDendrites
-experimentParams['Ih_vshift'] = Ih_vshift
-experimentParams['inst_rate_sampling_time_interval_options_ms'] = inst_rate_sampling_time_interval_options_ms
-experimentParams['num_bas_ex_spikes_per_100ms_range']          = num_bas_ex_spikes_per_100ms_range
-experimentParams['num_bas_ex_inh_spike_diff_per_100ms_range']  = num_bas_ex_inh_spike_diff_per_100ms_range
-experimentParams['num_apic_ex_spikes_per_100ms_range']         = num_apic_ex_spikes_per_100ms_range
-experimentParams['num_apic_ex_inh_spike_diff_per_100ms_range'] = num_apic_ex_inh_spike_diff_per_100ms_range
-experimentParams['allSectionsType']          = allSectionsType
-experimentParams['allSections_DistFromSoma'] = allSections_DistFromSoma
-experimentParams['allSectionsLength']        = allSectionsLength
-experimentParams['allSegmentsType']                 = allSegmentsType
-experimentParams['allSegmentsLength']               = allSegmentsLength
-experimentParams['allSegments_DistFromSoma']        = allSegments_DistFromSoma
-experimentParams['allSegments_SectionDistFromSoma'] = allSegments_SectionDistFromSoma
-experimentParams['allSegments_SectionInd']          = allSegments_SectionInd
-
-experimentParams['ISICV'] = ISICV
-experimentParams['listOfISIs'] = listOfISIs
-experimentParams['numOutputSpikesPerSim']     = numOutputSpikesPerSim
-experimentParams['totalNumOutputSpikes']      = totalNumOutputSpikes
-experimentParams['totalNumSimulationSeconds'] = totalNumSimulationSeconds
-experimentParams['averageOutputFrequency']    = averageOutputFrequency
-experimentParams['entireExperimentDurationInMinutes'] = entireExperimentDurationInMinutes
-
-# the important things to store
-experimentResults = {}
-experimentResults['listOfSingleSimulationDicts'] = listOfSingleSimulationDicts
-
-# the dict that will hold everything
-experimentDict = {}
-experimentDict['Params']  = experimentParams
-experimentDict['Results'] = experimentResults
-
-dirToSaveIn, filenameToSave = GetDirNameAndFileName(totalNumOutputSpikes, randomSeed)
-if not os.path.exists(dirToSaveIn):
-    os.makedirs(dirToSaveIn)
-
-# pickle everythin
-pickle.dump(experimentDict, open(dirToSaveIn + filenameToSave, "wb"), protocol=2)
-
-
+        cfg.OUTPUT_FILE = f"L5PC_pairs_part_{args.job_id}.h5"
+        print(f"=== Running Mode: PAIRS (Phase 2) | Job {args.job_id + 1}/{args.total_jobs} ===")
+
+    # 3. 初始化模型
+    print("Initializing Model...")
+    model = L5PC_Model(cfg)
+    meta = model.get_static_metadata()
+    total_synapses = len(model.synapses)
+    total_sim_steps = meta['total_time'] + 1
+
+    print(f"Total Synapses: {total_synapses}")
+
+    # 4. 初始化 HDF5
+    print(f"Initializing HDF5: {cfg.OUTPUT_FILE}")
+    h5_mgr = H5_Manager(cfg.OUTPUT_FILE, cfg)
+    h5_mgr.initialize_file(meta, total_sim_steps, total_synapses)
+
+    # 5. 任务分配逻辑
+    def get_tasks():
+        """根据 mode 和 job_id 生成当前进程需要执行的 active_indices 列表"""
+
+        if args.mode == 'setup':
+            # Phase 0: Baseline
+            yield []
+            # Phase 1: All Singles
+            for i in range(total_synapses):
+                yield [i]
+
+        elif args.mode == 'pairs':
+            # Phase 2: All Pairs
+            # 生成所有组合 (注意: 1278*1277/2 ≈ 81.6万, 列表占用内存极小，可直接生成)
+            all_pairs = list(itertools.combinations(range(total_synapses), 2))
+            total_tasks = len(all_pairs)
+
+            # 计算分片
+            chunk_size = math.ceil(total_tasks / args.total_jobs)
+            start_idx = args.job_id * chunk_size
+            end_idx = min(start_idx + chunk_size, total_tasks)
+
+            my_tasks = all_pairs[start_idx:end_idx]
+            print(f"Task Allocation: Processing pairs {start_idx} to {end_idx} (Count: {len(my_tasks)})")
+
+            for pair in my_tasks:
+                yield list(pair)
+
+    # 6. 执行循环
+    inputs_buffer = []
+    targets_buffer = []
+    count = 0
+    start_time = time.time()
+
+    try:
+        for active_indices in get_tasks():
+            # 运行模拟
+            inp, targ = model.run_simulation(active_indices)
+
+            inputs_buffer.append(inp)
+            targets_buffer.append(targ)
+
+            # 缓冲区满则写入
+            if len(inputs_buffer) >= args.batch_size:
+                batch_inputs = np.stack(inputs_buffer, axis=0)
+                batch_targets = np.stack(targets_buffer, axis=0)
+
+                h5_mgr.append_data(batch_inputs, batch_targets)
+
+                inputs_buffer = []
+                targets_buffer = []
+
+                count += args.batch_size
+                if count % (args.batch_size * 2) == 0:
+                    elapsed = time.time() - start_time
+                    rate = count / elapsed if elapsed > 0 else 0
+                    print(f"Progress: {count} sims done. Rate: {rate:.2f} sim/s")
+
+        # 写入剩余数据
+        if inputs_buffer:
+            batch_inputs = np.stack(inputs_buffer, axis=0)
+            batch_targets = np.stack(targets_buffer, axis=0)
+            h5_mgr.append_data(batch_inputs, batch_targets)
+            count += len(inputs_buffer)
+
+        print(f"\n[Done] Job finished. Total samples generated: {count}")
+        print(f"Data saved to: {cfg.OUTPUT_FILE}")
+
+    except KeyboardInterrupt:
+        print("\nSimulation interrupted by user. Closing file safely...")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        h5_mgr.close()
+
+
+if __name__ == "__main__":
+    main()
