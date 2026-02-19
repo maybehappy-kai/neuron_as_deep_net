@@ -7,6 +7,7 @@ import argparse
 import itertools
 import numpy as np
 import h5py
+import hdf5plugin  # 新增
 import neuron
 from neuron import h
 
@@ -37,10 +38,6 @@ class Config:
 
     # 输出文件名将在 main 中动态生成
     OUTPUT_FILE = "L5PC_output.h5"
-
-    # 数据压缩设置
-    COMPRESSION = "gzip"
-    COMPRESSION_OPTS = 4
 
 
 # ==========================================
@@ -221,22 +218,29 @@ class L5PC_Model:
                 pass
             return syn
 
+        # 预先准备两个临时列表
+        ex_syns_temp = []
+        inh_syns_temp = []
+
         for i, seg in enumerate(self.segments):
-            # 关键修改：如果是 Soma，则跳过添加突触
             if seg.sec in soma_sec_set:
                 continue
 
-            # 1. Add Excitatory Synapse
+            # 分别生成突触并附带对应的全局 segment 索引 (i)
             syn_ex = create_synapse(seg, 'AMPA_NMDA')
-            self.synapses.append(syn_ex)
-            self.input_map.append(i)  # 记录映射到哪个全局 segment
-            self.synapse_types.append(1)
+            ex_syns_temp.append((syn_ex, i, 1))  # (突触对象, seg索引, 类型)
 
-            # 2. Add Inhibitory Synapse
             syn_inh = create_synapse(seg, 'GABA_A')
-            self.synapses.append(syn_inh)
-            self.input_map.append(i)
-            self.synapse_types.append(-1)
+            inh_syns_temp.append((syn_inh, i, -1))
+
+        # 强制拼接：先兴奋，后抑制！
+        all_ordered_syns = ex_syns_temp + inh_syns_temp
+
+        # 注册到正式列表
+        for syn, seg_idx, s_type in all_ordered_syns:
+            self.synapses.append(syn)
+            self.input_map.append(seg_idx)
+            self.synapse_types.append(s_type)
 
         # 转换为 numpy 数组
         self.input_map = np.array(self.input_map, dtype=np.int32)
@@ -340,6 +344,10 @@ class L5PC_Model:
             for syn_idx in active_synapse_indices:
                 input_matrix[stim_step_idx, syn_idx] = 1
 
+        # 在返回前直接强行截断至目标时间步 (例如 6000)
+        target_steps = int((self.cfg.T_SETTLE + self.cfg.T_RECORD) / self.cfg.DT)
+        input_matrix = input_matrix[:target_steps, :]
+        v_trace = v_trace[:target_steps]
         return input_matrix, v_trace.reshape(-1, 1)
 
 
@@ -377,34 +385,31 @@ class H5_Manager:
         else:
             print(f"Opened existing HDF5 file: {self.filepath}")
 
+        # 准备 Blosc 压缩参数 (使用 lz4 算法，等级 5，开启 SHUFFLE 优化连续零的压缩率)
+        comp_kwargs = hdf5plugin.Blosc(cname='lz4', clevel=5, shuffle=hdf5plugin.Blosc.SHUFFLE)
+
         # 2. 准备动态数据集 /dataset
         if 'dataset' not in self.f:
             dset_grp = self.f.create_group('dataset')
 
             # A. inputs (输入脉冲矩阵)
-            # Shape: (Sample_Count, Time_Steps, Num_Synapses)
-            # Chunking: 强制以 (1, Time, Synapses) 为单位，优化单样本读取
             dset_grp.create_dataset(
                 'inputs',
                 shape=(0, total_sim_steps, num_synapses),
                 maxshape=(None, total_sim_steps, num_synapses),
                 dtype='uint8',
-                compression=self.cfg.COMPRESSION,
-                compression_opts=self.cfg.COMPRESSION_OPTS,
-                chunks=(1, total_sim_steps, num_synapses)
+                chunks=(1, total_sim_steps, num_synapses),
+                **comp_kwargs  # 替换原来的 compression 参数
             )
 
             # B. targets (输出膜电位)
-            # Shape: (Sample_Count, Time_Steps, 1)
-            # Chunking: (1, Time, 1)
             dset_grp.create_dataset(
                 'targets',
                 shape=(0, total_sim_steps, 1),
                 maxshape=(None, total_sim_steps, 1),
                 dtype='float32',
-                compression=self.cfg.COMPRESSION,
-                compression_opts=self.cfg.COMPRESSION_OPTS,
-                chunks=(1, total_sim_steps, 1)
+                chunks=(1, total_sim_steps, 1),
+                **comp_kwargs  # 替换原来的 compression 参数
             )
 
         # 保存 dataset 引用以便快速写入
@@ -452,28 +457,32 @@ def main():
     parser.add_argument("--job_id", type=int, default=0, help="当前任务ID (0-indexed)")
     parser.add_argument("--total_jobs", type=int, default=1, help="总并行任务数")
     parser.add_argument("--mode", type=str, choices=['setup', 'pairs'], default='setup',
-                        help="运行模式: 'setup' (跑Phase0+1) 或 'pairs' (跑Phase2)")
+                        help="运行模式: 'setup'或 'pairs'")
     parser.add_argument("--batch_size", type=int, default=50, help="H5写入批次大小")
+    # 新增两个参数
+    parser.add_argument("--out_dir", type=str, default="results", help="输出文件夹路径")
+    parser.add_argument("--smoke_test", action="store_true", help="开启冒烟测试 (仅抽取极少量突触)")
     args = parser.parse_args()
 
     cfg = Config()
 
-    # 2. 动态设置输出文件名
-    # setup 模式: L5PC_setup.h5
-    # pairs 模式: L5PC_pairs_part_X.h5
+    # 确保输出目录存在
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # 2. 动态设置输出文件名 (加入目录路径)
     if args.mode == 'setup':
-        cfg.OUTPUT_FILE = "L5PC_setup.h5"
-        print(f"=== Running Mode: SETUP (Phase 0 & 1) ===")
+        cfg.OUTPUT_FILE = os.path.join(args.out_dir, "L5PC_setup.h5")
+        print(f"=== Running Mode: SETUP ===")
     else:
-        cfg.OUTPUT_FILE = f"L5PC_pairs_part_{args.job_id}.h5"
-        print(f"=== Running Mode: PAIRS (Phase 2) | Job {args.job_id + 1}/{args.total_jobs} ===")
+        cfg.OUTPUT_FILE = os.path.join(args.out_dir, f"L5PC_pairs_part_{args.job_id}.h5")
+        print(f"=== Running Mode: PAIRS | Job {args.job_id + 1}/{args.total_jobs} ===")
 
     # 3. 初始化模型
     print("Initializing Model...")
     model = L5PC_Model(cfg)
     meta = model.get_static_metadata()
     total_synapses = len(model.synapses)
-    total_sim_steps = meta['total_time'] + 1
+    total_sim_steps = meta['total_time']
 
     print(f"Total Synapses: {total_synapses}")
 
@@ -482,24 +491,26 @@ def main():
     h5_mgr = H5_Manager(cfg.OUTPUT_FILE, cfg)
     h5_mgr.initialize_file(meta, total_sim_steps, total_synapses)
 
-    # 5. 任务分配逻辑
+    # 5. 任务分配逻辑 (核心修改点)
     def get_tasks():
-        """根据 mode 和 job_id 生成当前进程需要执行的 active_indices 列表"""
+        # 如果是冒烟测试，我们固定随机种子并只挑 15 个突触
+        # 必须固定种子！这样并行的所有 Job 才能“看到”同一个突触池，正确进行切片
+        if args.smoke_test:
+            np.random.seed(42)
+            subset = np.random.choice(total_synapses, size=15, replace=False).tolist()
+            subset.sort()
+        else:
+            subset = list(range(total_synapses))
 
         if args.mode == 'setup':
-            # Phase 0: Baseline
             yield []
-            # Phase 1: All Singles
-            for i in range(total_synapses):
+            for i in subset:
                 yield [i]
-
         elif args.mode == 'pairs':
-            # Phase 2: All Pairs
-            # 生成所有组合 (注意: 1278*1277/2 ≈ 81.6万, 列表占用内存极小，可直接生成)
-            all_pairs = list(itertools.combinations(range(total_synapses), 2))
+            # 只生成 subset 内的组合
+            all_pairs = list(itertools.combinations(subset, 2))
             total_tasks = len(all_pairs)
 
-            # 计算分片
             chunk_size = math.ceil(total_tasks / args.total_jobs)
             start_idx = args.job_id * chunk_size
             end_idx = min(start_idx + chunk_size, total_tasks)
