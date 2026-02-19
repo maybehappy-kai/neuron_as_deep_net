@@ -14,6 +14,13 @@ __pycache__/
 *.svg
 
 # 忽略具体的输出文件夹（代码里会往这些地方写东西）
+analysis/
+data_archive/
+extracted_voltage_data/
+old_codes/
+phase_plane_analysis/
+results_optimized_tcn/
+results_torch_tcn/
 data/
 models/
 figures/
