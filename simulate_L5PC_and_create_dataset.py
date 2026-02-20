@@ -10,6 +10,8 @@ import h5py
 import hdf5plugin  # 新增
 import neuron
 from neuron import h
+import json
+from scipy.optimize import brentq
 
 
 # ==========================================
@@ -59,7 +61,6 @@ class L5PC_Model:
         self._warmup()
 
     def _init_neuron(self):
-        """加载 hoc 文件，初始化 L5PC"""
         h.load_file('nrngui.hoc')
         h.load_file("import3d.hoc")
         h.load_file(self.cfg.BIOPHYS_FILE)
@@ -68,12 +69,70 @@ class L5PC_Model:
         h.celsius = self.cfg.CELSIUS
         h.dt = self.cfg.DT
 
-        # 实例化细胞
         self.cell = h.L5PCtemplate(self.cfg.MORPHOLOGY_FILE)
-
-        # 激活 CVode (但在固定步长记录时通常使用固定 dt)
-        # 为了严格的数据对齐，我们将使用固定步长积分
         h.cvode_active(0)
+
+        # 核心逻辑分发：是否启用活跃态缩放
+        if getattr(self.cfg, 'TARGET_V', None) is not None:
+            self._apply_scaled_background(self.cfg.TARGET_V)
+        else:
+            # 完全不干涉，设置 V_INIT 为其自然静息态（通常在 -80 左右）
+            self.cfg.V_INIT = -80.0
+            print("Background state: 0 interference (Deep Rest). V_INIT = -80.0 mV")
+
+    def _apply_scaled_background(self, target_v):
+        """读取锚点并使用 Brent 方法极速寻找匹配 target_v 的缩放系数 alpha"""
+        try:
+            with open("bg_anchors.json", "r") as f:
+                anchors = json.load(f)
+            ge_max = anchors["g_exc_max"]
+            gi_max = anchors["g_inh_max"]
+        except FileNotFoundError:
+            raise RuntimeError("bg_anchors.json not found! Please run find_bg_conductance.py first.")
+
+        orig_pas = {}
+        for sec in self.cell.all:
+            for seg in sec:
+                if hasattr(seg, 'pas'):
+                    orig_pas[seg] = {'g': seg.g_pas, 'e': seg.e_pas}
+
+        def apply_alpha(alpha):
+            ge = alpha * ge_max
+            gi = alpha * gi_max
+            for sec in self.cell.all:
+                for seg in sec:
+                    if hasattr(seg, 'pas'):
+                        g_old = orig_pas[seg]['g']
+                        e_old = orig_pas[seg]['e']
+                        g_new = g_old + ge + gi
+                        e_new = (g_old * e_old + ge * 0.0 + gi * (-80.0)) / g_new
+                        seg.g_pas = g_new
+                        seg.e_pas = e_new
+
+        # 核心改造：定义一个误差函数 (返回当前电压与目标的差值)
+        def voltage_error(alpha):
+            apply_alpha(alpha)
+            h.finitialize(target_v)
+            h.continuerun(2000.0)  # 跑一小段看稳态去向
+            current_v = self.cell.soma[0](0.5).v
+            print(f"  Testing alpha = {alpha:.4f} -> V_rest = {current_v:.3f} mV")
+            return current_v - target_v
+
+        print(f"Calibrating alpha for Target V = {target_v} mV using Brent's method...")
+
+        # 极速求解：brentq 会自动在 [0.0, 1.0] 之间寻找让 voltage_error 为 0 的根
+        # 只要保证 f(0) 和 f(1) 符号相反即可 (即 target_v 必须在静息和最大活跃电压之间)
+        try:
+            final_alpha = brentq(voltage_error, 0.0, 1.0, xtol=1e-4)
+        except ValueError:
+            raise ValueError(f"Target voltage {target_v} is out of achievable bounds [~ -81mV, ~ -67.7mV]")
+
+        # 应用最终算出的 alpha
+        apply_alpha(final_alpha)
+
+        # 更新全局 V_INIT 使得之后的 Warmup 极快
+        self.cfg.V_INIT = target_v
+        print(f"🎯 Calibration successful! Found alpha = {final_alpha:.4f}. Steady state set to {target_v} mV")
 
     def _setup_model_and_synapses(self):
         """
@@ -462,9 +521,12 @@ def main():
     # 新增两个参数
     parser.add_argument("--out_dir", type=str, default="results", help="输出文件夹路径")
     parser.add_argument("--smoke_test", action="store_true", help="开启冒烟测试 (仅抽取极少量突触)")
+    parser.add_argument("--target_v", type=float, default=None,
+                        help="目标稳态电压 (如 -75.0)。若不指定，则保持原始零背景静息态。")
     args = parser.parse_args()
 
     cfg = Config()
+    cfg.TARGET_V = args.target_v  # 将参数挂载到 cfg 上
 
     # 确保输出目录存在
     os.makedirs(args.out_dir, exist_ok=True)
