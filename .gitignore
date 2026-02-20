@@ -16,13 +16,14 @@ __pycache__/
 
 # 忽略具体的输出文件夹（代码里会往这些地方写东西）
 analysis/
+archive/
 data_archive/
 extracted_voltage_data/
 old_codes/
 phase_plane_analysis/
 results_optimized_tcn/
 results_torch_tcn/
-results_*/
+results*/
 data/
 models/
 figures/
