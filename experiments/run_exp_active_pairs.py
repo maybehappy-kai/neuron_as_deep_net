@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.l5pc_env import L5PC_Env
 from core.hdf5_writer import HDF5Writer
+from core.config import ACTIVE_TARGET_V
 
 # --- 实验全局配置 ---
 TOTAL_DURATION = 600.0  # 每次仿真的总时长 (ms)
@@ -29,11 +30,11 @@ def build_dense_input_matrix(spike_events, total_steps, num_synapses, dt):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Large-scale PSP Pairs Simulation (-67.7 mV Active State)")
+    parser = argparse.ArgumentParser(description="Large-scale PSP Pairs Simulation (Active State)")
     parser.add_argument("--job_id", type=int, default=0, help="Worker ID")
     parser.add_argument("--total_jobs", type=int, default=1, help="Total Workers")
     parser.add_argument("--out_dir", type=str, required=True, help="输出目录")
-    parser.add_argument("--target_v", type=float, default=-67.7, help="活跃态背景电压")
+    parser.add_argument("--target_v", type=float, default=ACTIVE_TARGET_V, help="活跃态背景电压")
     parser.add_argument("--batch_size", type=int, default=100, help="每积累多少个 trial 写入一次硬盘")
     args = parser.parse_args()
 

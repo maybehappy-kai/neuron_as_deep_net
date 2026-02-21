@@ -23,7 +23,7 @@ class HDF5Writer:
             self.f.attrs['dt'] = float(metadata.get("dt", 0.1))
             self.f.attrs['total_steps'] = int(total_sim_steps)
             self.f.attrs['num_synapses'] = int(num_synapses)
-            self.f.attrs['target_v_mV'] = float(metadata.get("target_v_mV", -80.0))
+            self.f.attrs['target_v_mV'] = float(metadata.get("target_v_mV", np.nan))
             print(f"Initialized new HDF5 file: {self.filepath} (Target V: {self.f.attrs['target_v_mV']} mV)")
 
         # 2. 严格按照规范写入静态组 (/static_info)

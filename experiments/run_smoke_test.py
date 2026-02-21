@@ -9,6 +9,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.l5pc_env import L5PC_Env
 from core.hdf5_writer import HDF5Writer
+from core.config import ACTIVE_TARGET_V
+import core.config as cfg
 
 # --- 实验全局配置 ---
 TOTAL_DURATION = 500.0  # 每次仿真的总时长 (ms)
@@ -30,14 +32,22 @@ def main():
     parser.add_argument("--job_id", type=int, default=0, help="Worker ID")
     parser.add_argument("--total_jobs", type=int, default=1, help="Total Workers")
     parser.add_argument("--out_dir", type=str, required=True, help="输出目录")
-    parser.add_argument("--target_v", type=float, default=-81.1, help="测试的目标基准电压")
+    parser.add_argument("--state", type=str, choices=['rest', 'active'], default='rest',
+                        help="测试的状态: rest (无干涉深度静息) 或 active (使用 config 中的活跃态)")
     args = parser.parse_args()
 
-    # 动态构建属于当前 worker 的临时文件路径
     h5_filepath = os.path.join(args.out_dir, f"part_{args.job_id}.h5")
-    meta_filepath = os.path.join(args.out_dir, "meta.h5")  # 用于 Orchestrator 合并
+    meta_filepath = os.path.join(args.out_dir, "meta.h5")
 
-    print(f"[Worker {args.job_id}] Initializing Environment (Target V: {args.target_v} mV)...")
+    # 根据传入的标签，自动去 config 里拿值
+    if args.state == 'active':
+        target_v = cfg.ACTIVE_TARGET_V
+        anchors_path = "configs/bg_anchors.json"
+    else:
+        target_v = cfg.REST_TARGET_V  # 这里即为 None
+        anchors_path = None
+
+    print(f"[Worker {args.job_id}] Initializing Environment (State: {args.state.upper()}, Target V: {target_v})...")
 
     # 1. 启动环境
     # 注意：请确保 morphologies 和 mods 等相关文件在 L5PC_NEURON_simulation/ 下
@@ -48,10 +58,10 @@ def main():
         dt=DT
     )
 
-    # 预热并获取物理状态元数据 (如果 target_v 为 -80，则不需要 anchors，内部会自动处理)
-    anchors_path = "configs/bg_anchors.json" if args.target_v != -80.0 else None
-    warmup_meta = env.warmup(target_v=args.target_v if args.target_v != -80.0 else None,
-                             anchors_path=anchors_path)
+    # 预热并获取物理状态元数据
+    # 只要 target_v 是 None，就不传 anchors_path
+    anchors_path = "configs/bg_anchors.json" if target_v is not None else None
+    warmup_meta = env.warmup(target_v=target_v, anchors_path=anchors_path)
     topo_meta = env.get_topology_metadata()
     full_metadata = {**topo_meta, **warmup_meta}
     num_synapses = topo_meta["num_synapses"]

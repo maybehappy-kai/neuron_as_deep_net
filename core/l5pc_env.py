@@ -1,12 +1,11 @@
 import os
+# 抑制 GUI
+os.environ['NEURON_MODULE_OPTIONS'] = '-nogui'
 import json
 import numpy as np
 from scipy.optimize import brentq
 import neuron
 from neuron import h
-
-# 抑制 NEURON 的 GUI 弹窗
-os.environ['NEURON_MODULE_OPTIONS'] = '-nogui'
 
 
 class L5PC_Env:
@@ -27,7 +26,7 @@ class L5PC_Env:
         self.segments = []
         self.netcons = []
         self.savestate = None
-        self.steady_state_v = -80.0  # 默认静息态
+        self.steady_state_v = None
 
         self._init_neuron()
         self._setup_model_and_synapses()
@@ -128,51 +127,31 @@ class L5PC_Env:
 
         # 布置突触 (辅助函数保持不变，仅省略了长长的参数设置以节省空间，建议原样拷贝你之前的 create_synapse 逻辑)
         def create_synapse(seg, syn_type):
-            syn = None
             if syn_type == 'AMPA_NMDA':
-                if hasattr(h, 'ProbAMPANMDA_EMS'):
-                    syn = h.ProbAMPANMDA_EMS(seg)
-                elif hasattr(h, 'ProbAMPANMDA2'):
-                    syn = h.ProbAMPANMDA2(seg)
-                if syn is None: raise RuntimeError("Mechanism not found")
-                if hasattr(syn, 'tau_r_AMPA'):
-                    syn.tau_r_AMPA = 0.3;
-                    syn.tau_d_AMPA = 3.0
-                    syn.tau_r_NMDA = 2.0;
-                    syn.tau_d_NMDA = 70.0
-                if hasattr(syn, 'gmax'):
-                    syn.gmax = self.cfg.SYN_GMAX_NMDA
-                elif hasattr(syn, 'gMax'):
-                    syn.gMax = self.cfg.SYN_GMAX_NMDA
+                # 严格对齐官方 NMDA 突触
+                syn = h.ProbAMPANMDA2(seg)
+                syn.tau_r_AMPA = 0.3
+                syn.tau_d_AMPA = 3.0
+                syn.tau_r_NMDA = 2.0
+                syn.tau_d_NMDA = 70.0
+                syn.gmax = 0.0004
+                syn.e = 0.0
             elif syn_type == 'GABA_A':
-                if hasattr(h, 'ProbGABAAB_EMS'):
-                    syn = h.ProbGABAAB_EMS(seg)
-                elif hasattr(h, 'ProbUDFsyn2'):
-                    syn = h.ProbUDFsyn2(seg)
-                if syn is None: raise RuntimeError("Mechanism not found")
-                if hasattr(syn, 'tau_r_GABAA'):
-                    syn.tau_r_GABAA = 0.2;
-                    syn.tau_d_GABAA = 8.0;
-                    syn.e_GABAA = -80.0
-                    syn.tau_r_GABAB = 3.5;
-                    syn.tau_d_GABAB = 260.9;
-                    syn.e_GABAB = -97.0
-                    if hasattr(syn, 'GABAB_ratio'): syn.GABAB_ratio = 0.0
-                elif hasattr(syn, 'tau_r'):
-                    syn.tau_r = 0.2;
-                    syn.tau_d = 8.0;
-                    syn.e = -80.0
-                if hasattr(syn, 'gmax'):
-                    syn.gmax = self.cfg.SYN_GMAX_GABA
-                elif hasattr(syn, 'gMax'):
-                    syn.gMax = self.cfg.SYN_GMAX_GABA
-            try:
-                syn.Use = 1.0;
-                syn.u0 = 0.0;
-                syn.Dep = 0.0;
-                syn.Fac = 0.0
-            except:
-                pass
+                # 严格对齐官方 GABA_A 突触
+                syn = h.ProbUDFsyn2(seg)
+                syn.tau_r = 0.2
+                syn.tau_d = 8.0
+                syn.gmax = 0.001
+                syn.e = -80.0
+            else:
+                raise ValueError(f"Unknown synapse type: {syn_type}")
+
+            # 统一的突触短时程可塑性参数 (当前均设为无)
+            syn.Use = 1.0
+            syn.u0 = 0.0
+            syn.Dep = 0.0
+            syn.Fac = 0.0
+
             return syn
 
         self.input_map = []
@@ -199,22 +178,34 @@ class L5PC_Env:
         self.input_map = np.array(self.input_map, dtype=np.int32)
         self.synapse_types = np.array(self.synapse_types, dtype=np.int8)
 
+        # 【修复核心2】: 记录每个片段的物理长度 (L / nseg)
+        self.seg_lengths = np.array([seg.sec.L / seg.sec.nseg for seg in self.segments], dtype=np.float32)
+
     def warmup(self, target_v=None, anchors_path="bg_anchors.json"):
-        """设定背景稳态并保存系统状态"""
-        # 将 target_v 重命名为 target_v_mV 以匹配规范
-        meta_info = {"target_v_mV": -80.0, "alpha": 0.0, "g_exc": 0.0, "g_inh": 0.0}
+        """设定背景稳态并保存系统状态，动态读取真实平衡电压"""
+        meta_info = {"alpha": 0.0, "g_exc": 0.0, "g_inh": 0.0}
 
         if target_v is not None:
             alpha, ge, gi = self._apply_scaled_background(target_v, anchors_path)
-            meta_info.update({"target_v_mV": target_v, "alpha": alpha, "g_exc": ge, "g_inh": gi})
+            meta_info.update({"alpha": alpha, "g_exc": ge, "g_inh": gi})
+            # 给出求解器初值猜测
+            initial_guess_v = target_v
         else:
-            self.steady_state_v = -80.0
+            # 无背景干涉时的初值猜测（仅供 NEURON 初始化使用，并非最终结果）
+            initial_guess_v = -81.1
 
-        h.finitialize(self.steady_state_v)
-        h.continuerun(3000.0)
+        h.finitialize(initial_guess_v)
+        h.continuerun(3000.0)  # 跑 3 秒让 Ih 等慢通道彻底平衡
+
+        # 【核心修正】：无论有无干涉，一律读取胞体此时的真实电位！
+        actual_steady_v = self.cell.soma[0](0.5).v
+        self.steady_state_v = actual_steady_v
+        meta_info["target_v_mV"] = float(actual_steady_v)
 
         self.savestate = h.SaveState()
         self.savestate.save()
+
+        print(f"[Environment] Warmup complete. Actual Steady State V: {actual_steady_v:.3f} mV")
         return meta_info
 
     def get_topology_metadata(self):

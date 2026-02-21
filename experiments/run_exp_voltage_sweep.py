@@ -11,13 +11,14 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.l5pc_env import L5PC_Env
 from core.hdf5_writer import HDF5Writer
+from core.config import ACTIVE_TARGET_V
 
 # --- 实验全局配置 ---
 TOTAL_DURATION = 600.0
 DT = 0.1
 STIM_TIME = 100.0
-# 135个电压点: -81.1 到 -67.7 (使用 round 防止浮点数精度问题)
-VOLTAGES = np.round(np.arange(-81.1, -67.6, 0.1), 1)
+sweep_end = np.round(ACTIVE_TARGET_V + 1.0, 1) # 比如 -68.0
+VOLTAGES = np.round(np.arange(-81.1, sweep_end, 0.1), 1)
 BASE_OUT_DIR = "results/voltage_sweep"
 
 
@@ -103,7 +104,7 @@ def merge_to_conditional_dataset(h5_files, final_path):
     with h5py.File(final_path, 'w') as f_out:
         for k, v in attrs.items():
             f_out.attrs[k] = v
-        f_out.attrs['description'] = "Voltage Sweep PSP Dataset (-81.1mV to -67.7mV)"
+        f_out.attrs['description'] = "Voltage Sweep PSP Dataset"
 
         g_static = f_out.create_group('static_info')
         for k, v in static_info.items():

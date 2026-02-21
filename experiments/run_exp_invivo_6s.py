@@ -1,7 +1,7 @@
 import os
 import sys
-import time
 import math
+import time
 import argparse
 import numpy as np
 
@@ -10,31 +10,38 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.l5pc_env import L5PC_Env
 from core.hdf5_writer import HDF5Writer
+import core.config as cfg  # 引入统一配置
 
 # --- 实验全局配置 ---
 TOTAL_DURATION = 6000.0  # 6秒长程仿真 (ms)
-DT = 0.1  # 保持 0.1ms 的高精度积分
-RATE_E = 5.0  # 兴奋性泊松发放率 (Hz)
-RATE_I = 5.0  # 抑制性泊松发放率 (Hz) - 经过 E/I 数量配比修正
+DT = 0.1
 
 
-def generate_poisson_spikes(rate_hz, duration_ms, rng):
-    """生成泊松分布的脉冲时间序列"""
-    rate_ms = rate_hz / 1000.0
-    spikes = []
-    t = 0.0
-    while True:
-        # 指数分布的间隔时间 (ISI)
-        isi = -math.log(1.0 - rng.rand()) / rate_ms
-        t += isi
-        if t >= duration_ms:
-            break
-        spikes.append(t)
-    return spikes
+def generate_ou_rate_trace(mu, sigma_ratio, tau, duration_ms, dt, rng):
+    """生成符合 OU 过程的非齐次发放率迹 (基于你的测算算法)"""
+    steps = int(duration_ms / dt)
+    sigma = mu * sigma_ratio
+    rate_trace = np.zeros(steps)
+    curr_rate = mu
+
+    dw_factor = sigma * math.sqrt(2 * dt / tau)
+    decay_factor = dt / tau
+
+    for i in range(steps):
+        curr_rate += (mu - curr_rate) * decay_factor + dw_factor * rng.standard_normal()
+        rate_trace[i] = max(0.1, curr_rate)
+    return rate_trace
+
+
+def generate_inhomogeneous_spikes(rate_trace, dt, rng):
+    """根据非齐次发放率迹生成脉冲"""
+    prob = rate_trace * (dt / 1000.0)
+    rand_vals = rng.rand(len(rate_trace))
+    spike_indices = np.where(rand_vals < prob)[0]
+    return spike_indices * dt
 
 
 def build_dense_input_matrix(spike_events, total_steps, num_synapses, dt):
-    """将极度密集的脉冲事件转化为 uint8 张量"""
     input_matrix = np.zeros((total_steps, num_synapses), dtype=np.uint8)
     for syn_idx, t in spike_events:
         step = int(t / dt)
@@ -44,19 +51,18 @@ def build_dense_input_matrix(spike_events, total_steps, num_synapses, dt):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="6-second In-vivo Poisson Bombardment Simulation")
+    parser = argparse.ArgumentParser(description="6s In-vivo Inhomogeneous Poisson Bombardment")
     parser.add_argument("--job_id", type=int, default=0, help="Worker ID")
     parser.add_argument("--total_jobs", type=int, default=1, help="Total Workers")
     parser.add_argument("--out_dir", type=str, required=True, help="输出目录")
     parser.add_argument("--num_trials", type=int, default=2000, help="总共要生成多少个 6 秒片段")
-    parser.add_argument("--batch_size", type=int, default=10, help="由于单 trial 数据量极大，需减小落盘批次")
+    parser.add_argument("--batch_size", type=int, default=10, help="单次落盘批次大小")
     args = parser.parse_args()
 
     h5_filepath = os.path.join(args.out_dir, f"part_{args.job_id}.h5")
     meta_filepath = os.path.join(args.out_dir, "meta.h5")
 
-    # 1. 启动神经元物理环境 (深度静息态，绝对无背景电导干涉)
-    print(f"[Worker {args.job_id}] Initializing deep rest environment (NO artificial target_v)...")
+    print(f"[Worker {args.job_id}] Initializing deep rest environment...")
     env = L5PC_Env(
         morphology_file="L5PC_NEURON_simulation/morphologies/cell1.asc",
         biophys_file="L5PC_NEURON_simulation/L5PCbiophys5b.hoc",
@@ -64,16 +70,19 @@ def main():
         dt=DT
     )
 
-    # 传入 target_v=None，完全凭借突触轰炸抬高电压
     warmup_meta = env.warmup(target_v=None)
     topo_meta = env.get_topology_metadata()
     full_metadata = {**topo_meta, **warmup_meta}
 
     num_synapses = topo_meta["num_synapses"]
-    total_steps = int(TOTAL_DURATION / DT)  # 60000 步
+    total_steps = int(TOTAL_DURATION / DT)
     syn_types = topo_meta["synapse_types"]
+    input_map = topo_meta["input_map"]
 
-    # 2. 初始化 HDF5 写入器
+    # 动态获取树突片段物理长度
+    seg_lengths = np.array([seg.sec.L / seg.sec.nseg for seg in env.segments], dtype=np.float32)
+    mean_length = np.mean(seg_lengths)
+
     writer = HDF5Writer(h5_filepath)
     writer.initialize(full_metadata, total_steps, num_synapses, split="train")
 
@@ -82,48 +91,48 @@ def main():
         meta_writer.initialize(full_metadata, total_steps, num_synapses, split="train")
         meta_writer.close()
 
-    # 3. 任务分配
     my_trials = range(args.job_id, args.num_trials, args.total_jobs)
-    print(f"[Worker {args.job_id}] Allocated {len(my_trials)} 6-second in-vivo trials.")
-
-    # 4. 执行 In-vivo 轰炸主循环
-    inputs_buffer = []
-    targets_buffer = []
+    inputs_buffer, targets_buffer = [], []
     start_time = time.time()
 
-    # 为每个 worker 设置独立的随机数生成器，确保泊松噪声绝对不重复
+    # 每个 Trial / Worker 使用不同种子，确保数据集多样性
     rng = np.random.RandomState(42 + args.job_id)
 
     for i, trial_idx in enumerate(my_trials):
-        spike_events = []
+        # 1. 为本次 trial 生成统一的集群波动迹 (OU Process)
+        trace_e = generate_ou_rate_trace(cfg.INVIVO_MU_E, cfg.INVIVO_SIGMA_RATIO, cfg.INVIVO_TAU, TOTAL_DURATION, DT,
+                                         rng)
+        trace_i = generate_ou_rate_trace(cfg.INVIVO_MU_I, cfg.INVIVO_SIGMA_RATIO, cfg.INVIVO_TAU, TOTAL_DURATION, DT,
+                                         rng)
 
-        # 为每个突触独立生成 6 秒的泊松脉冲列
+        spike_events = []
         for syn_idx in range(num_synapses):
-            rate = RATE_E if syn_types[syn_idx] == 1 else RATE_I
-            spikes = generate_poisson_spikes(rate, TOTAL_DURATION, rng)
+            seg_idx = input_map[syn_idx]
+            length_factor = seg_lengths[seg_idx] / mean_length
+
+            base_trace = trace_e if syn_types[syn_idx] == 1 else trace_i
+            scaled_trace = base_trace * length_factor
+
+            spikes = generate_inhomogeneous_spikes(scaled_trace, DT, rng)
             for t in spikes:
                 spike_events.append((syn_idx, t))
 
-        # 6秒内约有近万个脉冲，交给环境进行物理积分
+        # 物理积分
         v_trace = env.run_simulation(spike_events, total_duration=TOTAL_DURATION)
         input_mat = build_dense_input_matrix(spike_events, total_steps, num_synapses, DT)
 
         inputs_buffer.append(input_mat)
         targets_buffer.append(v_trace)
 
-        # 批次落盘 (60000 * 1278 的矩阵极其庞大，10个 trial 就会占用不少内存，必须高频 flush)
         if len(inputs_buffer) >= args.batch_size:
             writer.append(np.stack(inputs_buffer, axis=0), np.stack(targets_buffer, axis=0))
             inputs_buffer, targets_buffer = [], []
-
-            elapsed = time.time() - start_time
-            print(f"[Worker {args.job_id}] Progress: {i + 1}/{len(my_trials)} | Time elapsed: {elapsed:.1f}s")
+            print(f"[Worker {args.job_id}] Progress: {i + 1}/{len(my_trials)} | Time: {time.time() - start_time:.1f}s")
 
     if inputs_buffer:
         writer.append(np.stack(inputs_buffer, axis=0), np.stack(targets_buffer, axis=0))
 
     writer.close()
-    print(f"[Worker {args.job_id}] 🎉 In-vivo data generation completed!")
 
 
 if __name__ == "__main__":
